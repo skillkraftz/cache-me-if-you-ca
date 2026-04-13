@@ -3,42 +3,164 @@ import os
 import time
 import base64
 import json
-import hmac
-import hashlib
 import uuid
+
 import redis
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
 
 app = Flask(__name__)
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-# There is no fail-open path. The original service supported a STRICT_REDIS
-# toggle; removing the toggle is deliberate. Allowing Redis to be silently
-# bypassed lets an attacker DoS Redis (or wait for a partial failure) and
-# then replay nonces.
-TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
-ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET", "lab-access-token-secret")
-NONCE_TTL_SECONDS = int(os.getenv("NONCE_TTL_SECONDS", "60"))
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
-RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "60"))
-TOKEN_LIFETIME_SECONDS = int(os.getenv("TOKEN_LIFETIME_SECONDS", "30"))
-MAX_NONCE_LENGTH = int(os.getenv("MAX_NONCE_LENGTH", "128"))
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
+TOKEN_LIFETIME_SECONDS = int(os.getenv("TOKEN_LIFETIME_SECONDS", "30"))
+ASSERTION_MAX_LIFETIME_SECONDS = int(os.getenv("ASSERTION_MAX_LIFETIME_SECONDS", "60"))
+ASSERTION_REPLAY_TTL_SECONDS = int(os.getenv("ASSERTION_REPLAY_TTL_SECONDS", "120"))
+CLOCK_SKEW_SECONDS = int(os.getenv("CLOCK_SKEW_SECONDS", "5"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "60"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
+MAX_ASSERTION_SIZE = int(os.getenv("MAX_ASSERTION_SIZE", "4096"))
+SIGNING_KEY_ID = os.getenv("TOKEN_SIGNING_KEY_ID", "ts-v1")
+
+
+# -----------------------------------------------------------------------------
+# base64url + JWT-ish helpers (inlined to avoid a separate shared package)
+# -----------------------------------------------------------------------------
+
+
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _load_private(seed_b64: str) -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(_b64d(seed_b64))
+
+
+def _load_public(pub_b64: str) -> Ed25519PublicKey:
+    return Ed25519PublicKey.from_public_bytes(_b64d(pub_b64))
+
+
+def _pub_bytes(priv: Ed25519PrivateKey) -> bytes:
+    return priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def _sign_compact(priv: Ed25519PrivateKey, header: dict, payload: dict) -> str:
+    h_b64 = _b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    p_b64 = _b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    sig = priv.sign(signing_input)
+    return f"{h_b64}.{p_b64}.{_b64e(sig)}"
+
+
+def _verify_compact(pub_by_kid, token: str):
+    """Verify a compact Ed25519-signed JWT-like token.
+    pub_by_kid is a mapping of kid -> Ed25519PublicKey. Returns
+    (header, payload, None) on success or (None, None, reason) on failure.
+    """
+    if not token or token.count(".") != 2:
+        return None, None, "bad token format"
+    h_b64, p_b64, s_b64 = token.split(".", 2)
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    try:
+        header = json.loads(_b64d(h_b64).decode())
+        payload = json.loads(_b64d(p_b64).decode())
+        sig = _b64d(s_b64)
+    except Exception:
+        return None, None, "bad token encoding"
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return None, None, "bad token structure"
+    if header.get("alg") != "EdDSA":
+        return None, None, "bad alg"
+    if header.get("typ") != "JWT":
+        return None, None, "bad typ"
+    kid = header.get("kid")
+    pub = pub_by_kid.get(kid)
+    if pub is None:
+        return None, None, "unknown kid"
+    try:
+        pub.verify(sig, signing_input)
+    except InvalidSignature:
+        return None, None, "bad signature"
+    return header, payload, None
+
+
+# -----------------------------------------------------------------------------
+# Identity configuration
+# -----------------------------------------------------------------------------
+
+
+SIGNING_KEY = _load_private(os.environ["TOKEN_SIGNING_KEY_SEED_B64"])
+SIGNING_PUB = _pub_bytes(SIGNING_KEY)
+
+
+def _kid_for(label: str, version: str = "v1") -> str:
+    return f"{label}-{version}"
+
+
+# Registered clients. Each holds only a public key; the token-service holds
+# zero client secrets. Scopes here are the *self-mint* scopes available via
+# client_assertion alone. Any scope not in the set must be authorized by an
+# operator via actor_assertion.
 CLIENTS = {
     "gateway": {
-        "secret": os.getenv("GATEWAY_CLIENT_SECRET", "gateway-client-secret"),
-        "scopes": {
-            "admin.export.read",
-            "internal.metrics.read",
-            "debug.config.read",
-            "token.discovery",
+        "pub_by_kid": {
+            _kid_for("gateway-client"): _load_public(
+                os.environ["GATEWAY_CLIENT_PUB_KEY_B64"]
+            ),
         },
+        "scopes": set(),
         "audiences": {TOKEN_AUDIENCE},
+        "can_relay": True,
     },
     "observer": {
-        "secret": os.getenv("OBSERVER_CLIENT_SECRET", "observer-client-secret"),
+        "pub_by_kid": {
+            _kid_for("observer-client"): _load_public(
+                os.environ["OBSERVER_CLIENT_PUB_KEY_B64"]
+            ),
+        },
         "scopes": {"internal.metrics.read", "debug.config.read", "token.discovery"},
         "audiences": {TOKEN_AUDIENCE},
+        "can_relay": False,
     },
 }
+
+# Registered operators. Operators are the real authority for privileged
+# scopes; their entitlements do not live with any single client.
+OPERATORS = {
+    "ops-alice": {
+        "pub_by_kid": {
+            _kid_for("ops-alice"): _load_public(os.environ["OPS_ALICE_PUB_KEY_B64"]),
+        },
+        "scopes": {"admin.export.read", "internal.metrics.read", "debug.config.read"},
+    },
+    "ops-bob": {
+        "pub_by_kid": {
+            _kid_for("ops-bob"): _load_public(os.environ["OPS_BOB_PUB_KEY_B64"]),
+        },
+        "scopes": {"admin.export.read"},
+    },
+}
+
+
+# -----------------------------------------------------------------------------
+# Redis state: rate limit, assertion replay cache
+# -----------------------------------------------------------------------------
+
+
+class RedisUnavailable(Exception):
+    pass
+
 
 _redis_client = None
 
@@ -55,41 +177,15 @@ def _redis():
     return _redis_client
 
 
-class RedisUnavailable(Exception):
-    pass
-
-
-def _fail_closed_response():
+def _fail_closed():
     return jsonify({"error": "security state backend unavailable"}), 503
 
 
-def _claim_nonce(client_id: str, nonce: str):
-    """Atomically claim a per-client nonce. Returns (True, None, None) when
-    the nonce is fresh, (False, response, status) when it is a replay, and
-    raises RedisUnavailable when the backend cannot confirm the claim.
-    """
-    key = f"nonce:{client_id}:{nonce}"
-    try:
-        # SET key value NX EX TTL is an atomic claim-or-fail. Two concurrent
-        # mint requests carrying the same nonce cannot both succeed.
-        ok = _redis().set(key, "1", nx=True, ex=NONCE_TTL_SECONDS)
-    except Exception:
-        raise RedisUnavailable()
-    if not ok:
-        return False, jsonify({"error": "nonce replay"}), 403
-    return True, None, None
-
-
 def _check_rate(client_id: str):
-    """Atomic per-minute rate limit. Raises RedisUnavailable on backend
-    failure so the caller can fail the whole mint request.
-    """
     try:
         r = _redis()
         window = int(time.time() // 60)
         key = f"rate:{client_id}:{window}"
-        # Pipeline the INCR + EXPIRE so an intermediary crash cannot leave a
-        # counter without a TTL. INCR is already atomic by itself.
         pipe = r.pipeline()
         pipe.incr(key)
         pipe.expire(key, 120)
@@ -101,25 +197,120 @@ def _check_rate(client_id: str):
     return True, None, None
 
 
-def _b64e(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+def _claim_assertion_jti(kind: str, issuer: str, jti: str) -> bool:
+    """Claim a per-issuer assertion JTI atomically. Returns True if the JTI
+    was fresh and is now reserved, False if the same JTI has already been
+    seen. Raises RedisUnavailable on backend failure so the caller can fail
+    closed.
+    """
+    key = f"assert:{kind}:{issuer}:{jti}"
+    try:
+        ok = _redis().set(key, "1", nx=True, ex=ASSERTION_REPLAY_TTL_SECONDS)
+    except Exception:
+        raise RedisUnavailable()
+    return bool(ok)
 
 
-def _sign(payload):
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    sig = hmac.new(ACCESS_TOKEN_SECRET.encode(), body, hashlib.sha256).digest()
-    return f"{_b64e(body)}.{_b64e(sig)}"
+# -----------------------------------------------------------------------------
+# Assertion verification
+# -----------------------------------------------------------------------------
 
 
-def _authenticate_client():
-    """Return (client_id, None) on success or (None, (response, status))."""
-    client_id = request.headers.get("X-Client-Id", "") or ""
-    client_secret = request.headers.get("X-Client-Secret", "") or ""
-    if client_id not in CLIENTS:
-        return None, (jsonify({"error": "unknown client"}), 403)
-    if not hmac.compare_digest(client_secret, CLIENTS[client_id]["secret"]):
-        return None, (jsonify({"error": "bad client secret"}), 403)
-    return client_id, None
+def _check_assertion_claims(payload: dict, issuer_whitelist: set, now: int):
+    iss = payload.get("iss")
+    sub = payload.get("sub")
+    if not isinstance(iss, str) or iss not in issuer_whitelist:
+        return "unknown issuer"
+    if sub != iss:
+        return "iss must equal sub"
+    if payload.get("aud") != "token-service":
+        return "bad audience"
+    iat = payload.get("iat")
+    exp = payload.get("exp")
+    nbf = payload.get("nbf", iat)
+    if not isinstance(iat, int) or not isinstance(exp, int):
+        return "bad time claims"
+    if not isinstance(nbf, int):
+        nbf = iat
+    if iat > now + CLOCK_SKEW_SECONDS:
+        return "assertion from the future"
+    if nbf > now + CLOCK_SKEW_SECONDS:
+        return "assertion not yet valid"
+    if exp <= now - CLOCK_SKEW_SECONDS:
+        return "assertion expired"
+    if exp - iat > ASSERTION_MAX_LIFETIME_SECONDS + CLOCK_SKEW_SECONDS:
+        return "assertion lifetime too long"
+    jti = payload.get("jti")
+    if not isinstance(jti, str) or not jti or len(jti) > 128:
+        return "missing or bad jti"
+    return None
+
+
+def _verify_client_assertion(assertion: str):
+    if not assertion or len(assertion) > MAX_ASSERTION_SIZE:
+        return None, None, "bad client assertion size"
+    if assertion.count(".") != 2:
+        return None, None, "bad client assertion format"
+    h_b64, _p, _s = assertion.split(".", 2)
+    try:
+        header = json.loads(_b64d(h_b64).decode())
+    except Exception:
+        return None, None, "bad client assertion header"
+    if not isinstance(header, dict):
+        return None, None, "bad client assertion header"
+    kid = header.get("kid")
+    matching_client = None
+    pub_by_kid = None
+    for cid, conf in CLIENTS.items():
+        if kid in conf["pub_by_kid"]:
+            matching_client = cid
+            pub_by_kid = conf["pub_by_kid"]
+            break
+    if matching_client is None or pub_by_kid is None:
+        return None, None, "unknown client kid"
+    _h, payload, err = _verify_compact(pub_by_kid, assertion)
+    if err:
+        return None, None, err
+    err = _check_assertion_claims(payload, {matching_client}, int(time.time()))
+    if err:
+        return None, None, err
+    return matching_client, payload, None
+
+
+def _verify_actor_assertion(assertion: str):
+    if not assertion or len(assertion) > MAX_ASSERTION_SIZE:
+        return None, None, "bad actor assertion size"
+    if assertion.count(".") != 2:
+        return None, None, "bad actor assertion format"
+    h_b64, p_b64, _s = assertion.split(".", 2)
+    try:
+        header = json.loads(_b64d(h_b64).decode())
+    except Exception:
+        return None, None, "bad actor assertion header"
+    if not isinstance(header, dict):
+        return None, None, "bad actor assertion header"
+    kid = header.get("kid")
+    matching_op = None
+    pub_by_kid = None
+    for oid, conf in OPERATORS.items():
+        if kid in conf["pub_by_kid"]:
+            matching_op = oid
+            pub_by_kid = conf["pub_by_kid"]
+            break
+    if matching_op is None:
+        return None, None, "unknown operator kid"
+    _h, payload, err = _verify_compact(pub_by_kid, assertion)
+    if err:
+        return None, None, err
+    err = _check_assertion_claims(payload, {matching_op}, int(time.time()))
+    if err:
+        return None, None, err
+    return matching_op, payload, None
+
+
+# -----------------------------------------------------------------------------
+# HTTP routes
+# -----------------------------------------------------------------------------
 
 
 @app.get("/health")
@@ -127,86 +318,112 @@ def health():
     return jsonify({"ok": True, "service": "token-service"})
 
 
-@app.get("/.well-known/mesh")
-def mesh():
-    # Now requires authenticated client credentials and returns a minimal
-    # response that does not enumerate other clients. Used only for basic
-    # service discovery by already-credentialed peers.
-    client_id, err = _authenticate_client()
-    if err:
-        resp, status = err
-        return resp, status
+@app.get("/.well-known/jwks")
+def jwks():
+    """Public discovery of signing keys. This is anonymous because it
+    contains only the public key material needed to verify tokens. No
+    client identifiers, no scopes, no secrets.
+    """
     return jsonify(
         {
-            "service": "token-service",
-            "audience": TOKEN_AUDIENCE,
-            "caller": client_id,
+            "keys": [
+                {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "use": "sig",
+                    "alg": "EdDSA",
+                    "kid": SIGNING_KEY_ID,
+                    "x": _b64e(SIGNING_PUB),
+                }
+            ]
         }
     )
 
 
 @app.post("/v1/mint")
 def mint():
-    client_id, err = _authenticate_client()
-    if err:
-        resp, status = err
-        return resp, status
+    data = request.get_json(force=True, silent=True) or {}
+    client_assertion = data.get("client_assertion", "") or ""
+    actor_assertion = data.get("actor_assertion", "") or ""
+    requested_aud = data.get("audience", "")
+    requested_scope = data.get("scope", "")
 
-    nonce = request.headers.get("X-Nonce", "") or ""
-    # A missing or blank nonce used to fall back to a literal string that was
-    # shared across all callers; that silently broke replay protection. Now
-    # it is an explicit client error.
-    if not nonce or len(nonce) > MAX_NONCE_LENGTH:
-        return jsonify({"error": "missing or oversize X-Nonce header"}), 400
+    # Step 1: verify client assertion (always required).
+    client_id, client_payload, err = _verify_client_assertion(client_assertion)
+    if err:
+        return jsonify({"error": f"client_assertion: {err}"}), 403
 
     try:
         ok, body, status = _check_rate(client_id)
         if not ok:
             return body, status
-        ok, body, status = _claim_nonce(client_id, nonce)
-        if not ok:
-            return body, status
+        # Replay-protect the client assertion itself. Two mint calls with
+        # the same client assertion (i.e. same jti) cannot both succeed.
+        if not _claim_assertion_jti("client", client_id, client_payload["jti"]):
+            return jsonify({"error": "client_assertion replay"}), 403
     except RedisUnavailable:
-        return _fail_closed_response()
+        return _fail_closed()
 
-    data = request.get_json(force=True, silent=True) or {}
-    aud = data.get("audience", "")
-    scope = data.get("scope", "")
-    if aud not in CLIENTS[client_id]["audiences"]:
+    if requested_aud not in CLIENTS[client_id]["audiences"]:
         return jsonify({"error": "bad audience"}), 400
-    if scope not in CLIENTS[client_id]["scopes"]:
+
+    # Step 2: determine the effective subject and authorized scopes. If an
+    # actor assertion is supplied we require it to verify AND the client
+    # must be allowed to relay for operators.
+    effective_subject = client_id
+    actor_id = None
+    permitted_scopes = CLIENTS[client_id]["scopes"]
+
+    if actor_assertion:
+        if not CLIENTS[client_id]["can_relay"]:
+            return jsonify({"error": "client cannot relay actor assertions"}), 403
+        actor_id, actor_payload, err = _verify_actor_assertion(actor_assertion)
+        if err:
+            return jsonify({"error": f"actor_assertion: {err}"}), 403
+        try:
+            if not _claim_assertion_jti("actor", actor_id, actor_payload["jti"]):
+                return jsonify({"error": "actor_assertion replay"}), 403
+        except RedisUnavailable:
+            return _fail_closed()
+        # Scope must be a scope the operator actually holds.
+        permitted_scopes = OPERATORS[actor_id]["scopes"]
+        effective_subject = actor_id
+
+        # If the actor assertion pinned a specific scope, it must match
+        # the requested scope. This binds the operator's permission to the
+        # actual action being requested and stops a compromised relay from
+        # swapping in a different scope.
+        pinned_scope = actor_payload.get("scope")
+        if pinned_scope and pinned_scope != requested_scope:
+            return jsonify({"error": "actor_assertion scope mismatch"}), 403
+
+    if requested_scope not in permitted_scopes:
         return jsonify({"error": "scope not permitted"}), 403
 
-    # Subject is bound to the authenticated client. The request body no
-    # longer controls it: any supplied "subject" field is ignored. This
-    # stops subject spoofing by any caller that can reach /v1/mint with
-    # valid client credentials.
-    subject = client_id
-
     now = int(time.time())
-    # JTI is generated here from a cryptographically random UUID so that
-    # attacker-supplied nonces cannot influence its value. This keeps JTI
-    # uniqueness independent of caller behaviour and makes it safe to use
-    # as the replay-cache key on downstream services.
-    jti = str(uuid.uuid4())
-
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": SIGNING_KEY_ID}
     payload = {
         "iss": "token-service",
-        "sub": subject,
-        "aud": aud,
-        "scope": scope,
+        "sub": effective_subject,
+        "aud": requested_aud,
+        "scope": requested_scope,
         "iat": now,
         "nbf": now,
         "exp": now + TOKEN_LIFETIME_SECONDS,
-        "jti": jti,
+        "jti": str(uuid.uuid4()),
     }
+    if actor_id is not None:
+        payload["act"] = {"sub": client_id}
+
+    token = _sign_compact(SIGNING_KEY, header, payload)
     return jsonify(
         {
-            "access_token": _sign(payload),
-            "scope": scope,
-            "issued_to": client_id,
-            "subject": subject,
+            "access_token": token,
+            "token_type": "Bearer",
+            "scope": requested_scope,
             "expires_in": TOKEN_LIFETIME_SECONDS,
+            "subject": effective_subject,
+            "issued_to": client_id,
         }
     )
 

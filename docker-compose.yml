@@ -6,13 +6,17 @@ services:
     environment:
       APP_ENV: dev
       REQUEST_TIMEOUT: "3"
-      ADMIN_API_KEY: lab-admin-key
       TOKEN_SERVICE_URL: http://token-service:5003
       INTERNAL_ADMIN_A_URL: http://internal-admin-a:5001
       INTERNAL_ADMIN_B_URL: http://internal-admin-b:5001
       ALLOWED_PROXY_URLS: http://internal-admin-a:5001/health,http://internal-admin-b:5001/health
       GATEWAY_CLIENT_ID: gateway
-      GATEWAY_CLIENT_SECRET: gateway-client-secret
+      # Gateway holds ONLY its own client signing seed. It has no signing
+      # secret for access tokens and no operator key material. Even with a
+      # full compromise of this container, an attacker cannot forge an
+      # access token or an operator actor assertion.
+      GATEWAY_CLIENT_KEY_ID: gateway-client-v1
+      GATEWAY_CLIENT_KEY_SEED_B64: "Z2F0ZXdheS1jbGllbnQwMDAwMDAwMDAwMDAwMDAwMDA"
     depends_on:
       - token-service
       - internal-admin-a
@@ -27,10 +31,12 @@ services:
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-a
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
       REDIS_URL: redis://redis:6379/0
+      # Only public verification key material is present here. This service
+      # cannot sign a token. Format: kid:b64pub,kid:b64pub,...
+      TOKEN_VERIFY_KEYS: "ts-v1:4_8ZaE2hEz2uzxSMv0nhZT44RTGh6ugyXSOLxE8Xfq0"
     expose:
       - "5001"
     networks:
@@ -41,10 +47,10 @@ services:
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-b
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
       REDIS_URL: redis://redis:6379/0
+      TOKEN_VERIFY_KEYS: "ts-v1:4_8ZaE2hEz2uzxSMv0nhZT44RTGh6ugyXSOLxE8Xfq0"
     expose:
       - "5001"
     networks:
@@ -56,12 +62,21 @@ services:
       APP_ENV: dev
       REDIS_URL: redis://redis:6379/0
       TOKEN_AUDIENCE: internal-admin
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
-      NONCE_TTL_SECONDS: "60"
+      TOKEN_LIFETIME_SECONDS: "30"
+      ASSERTION_MAX_LIFETIME_SECONDS: "60"
+      ASSERTION_REPLAY_TTL_SECONDS: "120"
       RATE_LIMIT_PER_MINUTE: "120"
       RATE_LIMIT_BURST: "60"
-      GATEWAY_CLIENT_SECRET: gateway-client-secret
-      OBSERVER_CLIENT_SECRET: observer-client-secret
+      # Token-service holds the access-token signing private key and the
+      # PUBLIC keys of every registered client and operator. It never
+      # holds any client's private key. Seeds / public keys shown here are
+      # pre-generated deterministic lab values.
+      TOKEN_SIGNING_KEY_ID: ts-v1
+      TOKEN_SIGNING_KEY_SEED_B64: "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
+      GATEWAY_CLIENT_PUB_KEY_B64: "UsRt0XPePJ858wUZlTOp44t36rIyEO5Z3I_dfNtG4LE"
+      OBSERVER_CLIENT_PUB_KEY_B64: "a9YuwsoT6OWRLNNl_z6Wtkic_X1t8BiM0Qwnu1Em4Sg"
+      OPS_ALICE_PUB_KEY_B64: "S0Q3Ys5mH6eHdtxMATWiCe6vdSAVpeTEt2s7bWMmEig"
+      OPS_BOB_PUB_KEY_B64: "i8k_8G5WJji2vXsn9VD4bDpaHeVGp0Tc1Q1734gFluk"
     expose:
       - "5003"
     depends_on:

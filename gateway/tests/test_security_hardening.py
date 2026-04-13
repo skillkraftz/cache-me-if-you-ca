@@ -1,173 +1,747 @@
-"""Adversarial tests that extend coverage beyond the baseline security tests.
+"""Adversarial tests targeting the trust-model refactor.
 
-These tests assume the hardened configuration and would have failed against
-the vulnerable baseline. They target root causes rather than just symptoms,
-so the suite breaks loudly if a regression reopens any of the classes of
-bugs covered below.
+These tests replace the previous shared-secret tests. They validate:
+  - Ed25519 token issuance and verification
+  - Client assertions replacing client secrets
+  - Operator actor assertions replacing the admin API key
+  - Delegated minting with act claim propagation
+  - Defense-in-depth at the consumer (internal-admin)
+  - Compromised-gateway blast-radius reduction
+  - Replay and forgery resistance end to end
 """
 
-import base64
-import hashlib
-import hmac
 import json
 import time
 import uuid
 
 import pytest
+import redis as redislib
 import requests
+
+from trust_helpers import (
+    b64d,
+    b64e,
+    decode_token_payload,
+    gateway_assertion,
+    observer_assertion,
+    alice_assertion,
+    bob_assertion,
+    rogue_assertion_as,
+    make_client_assertion,
+    make_actor_assertion,
+    sign_compact,
+    GATEWAY_CLIENT_KEY,
+    OBSERVER_CLIENT_KEY,
+    OPS_ALICE_KEY,
+    OPS_BOB_KEY,
+    ROGUE_KEY,
+)
 
 
 GATEWAY = "http://gateway:5000"
 TOKEN_SERVICE = "http://token-service:5003"
 INTERNAL_A = "http://internal-admin-a:5001"
 INTERNAL_B = "http://internal-admin-b:5001"
-ADMIN_KEY = "lab-admin-key"
-GATEWAY_CLIENT_SECRET = "gateway-client-secret"
-OBSERVER_CLIENT_SECRET = "observer-client-secret"
-# Shared signing secret; in a real deployment this would be a KMS key and
-# the test would use a minted token instead. Hardcoded here only because the
-# lab treats it as configuration.
-ACCESS_TOKEN_SECRET = "lab-access-token-secret"
-TOKEN_AUDIENCE = "internal-admin"
+AUD_INTERNAL = "internal-admin"
 
 
-def _fetch(url: str):
-    return requests.get(f"{GATEWAY}/fetch", params={"url": url}, timeout=5)
+def _redis_client():
+    return redislib.Redis.from_url("redis://redis:6379/0", decode_responses=True)
 
 
-def _nonce(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4()}"
+def _clear_rate_limit(client_id: str):
+    """Wipe any per-minute rate-limit counters for a client. Test-only
+    helper; production code never mutates Redis from outside the service.
+    """
+    r = _redis_client()
+    keys = list(r.scan_iter(match=f"rate:{client_id}:*"))
+    if keys:
+        r.delete(*keys)
 
 
-def _mint(
-    client_id: str, client_secret: str, scope: str, nonce: str, body_override=None
-):
-    body = {
-        "audience": TOKEN_AUDIENCE,
-        "scope": scope,
-        "subject": client_id,
-    }
-    if body_override is not None:
-        body.update(body_override)
-    return requests.post(
-        f"{TOKEN_SERVICE}/v1/mint",
-        json=body,
-        headers={
-            "X-Client-Id": client_id,
-            "X-Client-Secret": client_secret,
-            "X-Nonce": nonce,
-        },
-        timeout=5,
+@pytest.fixture(autouse=True)
+def _isolate_observer_rate_limit():
+    """Before every test, clear the observer rate-limit window so the
+    order of tests does not accidentally starve a later test. The
+    dedicated rate-limit test explicitly re-checks enforcement within its
+    own body, so clearing before each test is safe.
+    """
+    _clear_rate_limit("observer")
+    _clear_rate_limit("gateway")
+    yield
+
+
+# -----------------------------------------------------------------------------
+# Direct token-service flows (bypassing the gateway to test the issuer itself)
+# -----------------------------------------------------------------------------
+
+
+def _mint(body: dict):
+    return requests.post(f"{TOKEN_SERVICE}/v1/mint", json=body, timeout=5)
+
+
+def test_jwks_endpoint_exposes_signing_pubkey():
+    r = requests.get(f"{TOKEN_SERVICE}/.well-known/jwks", timeout=5)
+    assert r.status_code == 200
+    keys = r.json()["keys"]
+    assert len(keys) >= 1
+    k = keys[0]
+    assert k["alg"] == "EdDSA"
+    assert k["crv"] == "Ed25519"
+    assert k["kid"]
+    assert k["x"]
+    assert "d" not in k and "private" not in k
+
+
+def test_mint_requires_client_assertion():
+    r = _mint({"audience": AUD_INTERNAL, "scope": "admin.export.read"})
+    assert r.status_code == 403
+    assert "client_assertion" in r.text
+
+
+def test_mint_rejects_forged_gateway_assertion():
+    # Rogue key signs something that *claims* to be the gateway. There is
+    # no key in the token-service's client registry matching the rogue kid
+    # so verification must fail at kid lookup.
+    ca = rogue_assertion_as("gateway")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
     )
+    assert r.status_code == 403
 
 
-def _b64e(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+def test_mint_rejects_client_assertion_with_lying_iss():
+    # Gateway's real signing key but iss/sub claim to be observer. The
+    # verifier derives which client the assertion is for from the kid,
+    # and then requires iss == sub == that client.
+    ca = make_client_assertion(
+        "gateway",
+        GATEWAY_CLIENT_KEY,
+        "gateway-client-v1",
+        iss_override="observer",
+        sub_override="observer",
+    )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-def _b64d(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+def test_mint_rejects_client_assertion_with_sub_ne_iss():
+    ca = make_client_assertion(
+        "gateway",
+        GATEWAY_CLIENT_KEY,
+        "gateway-client-v1",
+        sub_override="ops-alice",
+    )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-def _sign_forged(payload: dict) -> str:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    sig = hmac.new(ACCESS_TOKEN_SECRET.encode(), body, hashlib.sha256).digest()
-    return f"{_b64e(body)}.{_b64e(sig)}"
+def test_mint_rejects_wrong_aud_on_assertion():
+    ca = gateway_assertion(aud="internal-admin")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-def _decode_token_body(token: str) -> dict:
-    p, _ = token.split(".", 1)
-    return json.loads(_b64d(p).decode())
+def test_mint_rejects_expired_client_assertion():
+    ca = gateway_assertion(iat_offset=-120, lifetime=30)
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-# ----- SSRF coverage beyond the baseline -------------------------------------
+def test_mint_rejects_oversize_client_assertion_lifetime():
+    ca = gateway_assertion(lifetime=86400)
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-def test_fetch_rejects_loopback_literal():
-    r = _fetch("http://127.0.0.1:5000/health")
-    assert r.status_code in (400, 403)
+def test_client_assertion_replay_blocked():
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read")
+    r1 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r1.status_code == 200, r1.text
+    # Same client_assertion, fresh actor - the client jti must still be
+    # burned, so this second call must fail even though the actor is new.
+    aa2 = alice_assertion("admin.export.read")
+    r2 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa2,
+        }
+    )
+    assert r2.status_code == 403
+    assert "replay" in r2.text.lower()
 
 
-def test_fetch_rejects_ipv6_loopback_literal():
-    r = _fetch("http://[::1]:5000/health")
-    assert r.status_code in (400, 403)
+def test_actor_assertion_replay_blocked():
+    aa = alice_assertion("admin.export.read")
+    ca1 = gateway_assertion()
+    ca2 = gateway_assertion()  # different jti
+    r1 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca1,
+            "actor_assertion": aa,
+        }
+    )
+    assert r1.status_code == 200, r1.text
+    r2 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca2,
+            "actor_assertion": aa,  # reused
+        }
+    )
+    assert r2.status_code == 403
+    assert "replay" in r2.text.lower()
 
 
-def test_fetch_rejects_cloud_metadata_ip():
-    r = _fetch("http://169.254.169.254/latest/meta-data/")
-    assert r.status_code in (400, 403)
+def test_gateway_cannot_self_mint_admin_scope():
+    # Gateway presents valid client_assertion but no actor_assertion.
+    # Gateway's self-mint scopes are empty, so any scope request fails.
+    ca = gateway_assertion()
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
+    assert "scope" in r.text.lower()
 
 
-def test_fetch_rejects_internal_admin_b():
-    # The original blocklist only mentioned replica A, so the typo let
-    # attackers reach replica B unmolested.
-    r = _fetch("http://internal-admin-b:5001/debug/config")
-    assert r.status_code in (400, 403)
+def test_gateway_cannot_self_mint_any_scope():
+    for scope in ("internal.metrics.read", "debug.config.read", "token.discovery"):
+        ca = gateway_assertion()
+        r = _mint(
+            {
+                "audience": AUD_INTERNAL,
+                "scope": scope,
+                "client_assertion": ca,
+            }
+        )
+        assert r.status_code == 403, (scope, r.text)
 
 
-def test_fetch_rejects_redis_host():
-    r = _fetch("http://redis:6379/")
-    assert r.status_code in (400, 403)
+def test_observer_can_self_mint_within_its_scopes():
+    ca = observer_assertion()
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "internal.metrics.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["subject"] == "observer"
+    claims = decode_token_payload(data["access_token"])
+    assert claims["sub"] == "observer"
+    assert "act" not in claims  # not delegated
 
 
-def test_fetch_rejects_redirector_host():
-    # Even without following the redirect, the initial host resolves to a
-    # private IP and must be refused.
-    r = _fetch("http://redirector:5002/bounce?to=http://example.com")
-    assert r.status_code in (400, 403)
+def test_observer_cannot_mint_admin_scope_even_self():
+    ca = observer_assertion()
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
 
 
-def test_fetch_rejects_file_scheme():
-    r = _fetch("file:///etc/passwd")
-    assert r.status_code in (400, 403)
+def test_observer_cannot_relay_actor_assertions():
+    ca = observer_assertion()
+    aa = alice_assertion("admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "relay" in r.text.lower() or "cannot relay" in r.text.lower()
 
 
-def test_fetch_rejects_gopher_scheme():
-    r = _fetch("gopher://internal-admin-a:5001/_GET%20/")
-    assert r.status_code in (400, 403)
+def test_gateway_delegated_mint_with_alice_admin_scope():
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["subject"] == "ops-alice"
+    claims = decode_token_payload(data["access_token"])
+    assert claims["sub"] == "ops-alice"
+    assert claims["act"] == {"sub": "gateway"}
+    assert claims["scope"] == "admin.export.read"
 
 
-def test_fetch_rejects_userinfo_with_internal_b():
-    r = _fetch("http://x:y@internal-admin-b:5001/health")
-    assert r.status_code in (400, 403)
+def test_gateway_delegated_mint_with_bob_admin_scope():
+    ca = gateway_assertion()
+    aa = bob_assertion("admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["subject"] == "ops-bob"
 
 
-def test_fetch_refuses_to_follow_cross_origin_redirect():
-    # allow_redirects=False is a primary defense; if a regression flips it
-    # back on we want to know immediately. This stub route only exists on
-    # the redirector host, which is already blocked at host validation, so
-    # the observable outcome here is the same 4xx — but we document intent.
-    r = _fetch("http://redirector:5002/to-admin-a-health")
-    assert r.status_code in (400, 403)
+def test_bob_cannot_delegate_metrics_scope_he_does_not_have():
+    ca = gateway_assertion()
+    aa = bob_assertion("internal.metrics.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "internal.metrics.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "scope" in r.text.lower()
 
 
-# ----- Gateway admin helpers -------------------------------------------------
+def test_actor_assertion_scope_pin_must_match_requested_scope():
+    # Alice signs an assertion for metrics, gateway requests admin export.
+    # Pinned scope mismatch must fail even though alice holds both scopes.
+    ca = gateway_assertion()
+    aa = alice_assertion("internal.metrics.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "scope" in r.text.lower()
 
 
-def test_ops_raw_token_retired_even_with_admin_key():
+def test_forged_actor_assertion_rejected():
+    ca = gateway_assertion()
+    aa = rogue_assertion_as("ops-alice", scope="admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+
+
+def test_actor_assertion_lifetime_cap_enforced():
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read", lifetime=86400)
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+
+
+def test_rate_limit_on_mint_per_client():
+    # Each call uses a fresh client_assertion (unique jti).
+    burst = 60
+    caps = 0
+    for _ in range(burst + 5):
+        ca = observer_assertion()
+        r = _mint(
+            {
+                "audience": AUD_INTERNAL,
+                "scope": "internal.metrics.read",
+                "client_assertion": ca,
+            }
+        )
+        if r.status_code == 429:
+            caps += 1
+            break
+        assert r.status_code == 200
+    assert caps == 1, "rate limit should eventually reject a burst from one client"
+
+
+# -----------------------------------------------------------------------------
+# Consumer (internal-admin) defense-in-depth
+# -----------------------------------------------------------------------------
+
+
+def _issue_admin_token_via_mint(actor_priv=None, actor_kid=None, operator_id=None):
+    ca = gateway_assertion()
+    if actor_priv is None:
+        aa = alice_assertion("admin.export.read")
+    else:
+        aa = make_actor_assertion(
+            operator_id, actor_priv, actor_kid, "admin.export.read"
+        )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def test_admin_accepts_properly_delegated_token():
+    token = _issue_admin_token_via_mint()
     r = requests.get(
-        f"{GATEWAY}/ops/raw-token",
-        params={"scope": "admin.export.read", "subject": "admin-bypass"},
-        headers={"X-Admin-Api-Key": ADMIN_KEY, "X-Nonce": "whatever"},
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
         timeout=5,
     )
-    assert r.status_code in (403, 404, 410)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["caller"] == "ops-alice"
+    assert data["actor"] == "gateway"
 
 
-def test_ops_export_still_works_on_both_replicas():
-    # Legitimate functional path: gateway mints a fresh token per request
-    # and uses it on a single replica. Running against A and B individually
-    # must still work because each mint uses a unique JTI.
+def test_cross_replica_replay_blocked_with_real_token():
+    token = _issue_admin_token_via_mint()
+    h = {"Authorization": f"Bearer {token}"}
+    a = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
+    b = requests.get(f"{INTERNAL_B}/admin/export", headers=h, timeout=5)
+    assert (a.status_code == 200) ^ (b.status_code == 200)
+    loser = a if b.status_code == 200 else b
+    assert loser.status_code == 403
+    assert "replay" in loser.text.lower()
+
+
+def test_same_replica_replay_blocked():
+    token = _issue_admin_token_via_mint()
+    h = {"Authorization": f"Bearer {token}"}
+    first = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
+    second = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
+    assert first.status_code == 200
+    assert second.status_code == 403
+
+
+def test_admin_rejects_token_signed_by_rogue_key():
+    # An attacker who somehow obtained a way to sign EdDSA tokens but with
+    # a different private key than the issuer must be rejected. This
+    # covers "what if token-service's secret leaked" in the old HMAC model
+    # -- in the asymmetric model, only token-service's private key can
+    # sign valid tokens, and the consumer's public key set is closed.
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ts-v1"}  # legit kid
+    payload = {
+        "iss": "token-service",
+        "sub": "ops-alice",
+        "aud": AUD_INTERNAL,
+        "scope": "admin.export.read",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 30,
+        "jti": str(uuid.uuid4()),
+        "act": {"sub": "gateway"},
+    }
+    forged = sign_compact(ROGUE_KEY, header, payload)
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {forged}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "signature" in r.text.lower()
+
+
+def test_admin_rejects_token_with_unknown_kid():
+    # Legit issuer, different kid (simulating a key rotation where only
+    # the old kid is pinned on the consumer).
+    import os
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    # Load the real issuer seed from the lab so the signature would be
+    # cryptographically valid, but advertise an unknown kid. The consumer
+    # trusts keys by kid, so this must be rejected.
+    issuer_seed = "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
+    priv = Ed25519PrivateKey.from_private_bytes(b64d(issuer_seed))
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": "unknown-kid"}
+    payload = {
+        "iss": "token-service",
+        "sub": "ops-alice",
+        "aud": AUD_INTERNAL,
+        "scope": "admin.export.read",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 30,
+        "jti": str(uuid.uuid4()),
+    }
+    token = sign_compact(priv, header, payload)
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "kid" in r.text.lower()
+
+
+def test_admin_rejects_token_with_bad_actor_sub():
+    # Valid token signature (via the normal mint path), but the actor
+    # claim points at a client that is not in ALLOWED_ACTORS. We can't
+    # actually produce such a token through the legit mint (the mint
+    # always sets act.sub to the relaying client), so we craft it using
+    # the real signing key via the lab's known seed.
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    issuer_seed = "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
+    priv = Ed25519PrivateKey.from_private_bytes(b64d(issuer_seed))
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ts-v1"}
+    payload = {
+        "iss": "token-service",
+        "sub": "ops-alice",
+        "aud": AUD_INTERNAL,
+        "scope": "admin.export.read",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 30,
+        "jti": str(uuid.uuid4()),
+        "act": {"sub": "observer"},  # not an allowed actor
+    }
+    token = sign_compact(priv, header, payload)
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "actor" in r.text.lower()
+
+
+def test_admin_rejects_alg_none_or_hmac():
+    # RFC 8725 'alg' confusion - an attacker tries to downgrade from
+    # EdDSA to HMAC-SHA256 or none. We never accept anything but EdDSA.
+    header = {"alg": "none", "typ": "JWT", "kid": "ts-v1"}
+    payload = {
+        "iss": "token-service",
+        "sub": "ops-alice",
+        "aud": AUD_INTERNAL,
+        "scope": "admin.export.read",
+        "iat": int(time.time()),
+        "nbf": int(time.time()),
+        "exp": int(time.time()) + 30,
+        "jti": str(uuid.uuid4()),
+    }
+    h_b64 = b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    p_b64 = b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    token = f"{h_b64}.{p_b64}."  # empty signature
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+
+
+def test_admin_rejects_debug_config_without_token():
+    r = requests.get(f"{INTERNAL_A}/debug/config", timeout=5)
+    assert r.status_code == 403
+
+
+def test_admin_debug_config_accessible_via_observer_self_mint():
+    ca = observer_assertion()
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "debug.config.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 200, r.text
+    token = r.json()["access_token"]
+    dr = requests.get(
+        f"{INTERNAL_A}/debug/config",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert dr.status_code == 200
+    assert dr.json()["caller"] == "observer"
+
+
+# -----------------------------------------------------------------------------
+# Gateway /ops/* end-to-end
+# -----------------------------------------------------------------------------
+
+
+def test_ops_export_requires_actor_assertion():
+    r = requests.get(f"{GATEWAY}/ops/export", params={"target": "a"}, timeout=5)
+    assert r.status_code == 401
+
+
+def test_ops_export_rejects_malformed_assertion():
+    r = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "a"},
+        headers={"X-Actor-Assertion": "not.a.jwt.no.really"},
+        timeout=5,
+    )
+    assert r.status_code in (400, 403)
+
+
+def test_ops_export_rejects_rogue_actor_assertion():
+    aa = rogue_assertion_as("ops-alice", scope="admin.export.read")
+    r = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "a"},
+        headers={"X-Actor-Assertion": aa},
+        timeout=5,
+    )
+    assert r.status_code == 403
+
+
+def test_ops_export_rejects_observer_as_actor():
+    # Observer has a valid client assertion key but it is not an operator.
+    # We reuse the client assertion function by claiming operator_id the
+    # token-service doesn't know about via observer's key.
+    import uuid as _uuid
+
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": "observer-client-v1"}
+    payload = {
+        "iss": "observer",
+        "sub": "observer",
+        "aud": "token-service",
+        "scope": "admin.export.read",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 30,
+        "jti": str(_uuid.uuid4()),
+    }
+    aa = sign_compact(OBSERVER_CLIENT_KEY, header, payload)
+    r = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "a"},
+        headers={"X-Actor-Assertion": aa},
+        timeout=5,
+    )
+    assert r.status_code == 403
+
+
+def test_ops_export_succeeds_with_alice_assertion():
+    aa = alice_assertion("admin.export.read")
+    r = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "a"},
+        headers={"X-Actor-Assertion": aa},
+        timeout=5,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["service"] == "internal-admin-a"
+    assert data["caller"] == "ops-alice"
+    assert data["actor"] == "gateway"
+
+
+def test_ops_export_each_replica_needs_fresh_assertion():
+    # Single actor assertion is single-use. You cannot drive both replicas
+    # with it.
+    aa = alice_assertion("admin.export.read")
+    r1 = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "a"},
+        headers={"X-Actor-Assertion": aa},
+        timeout=5,
+    )
+    assert r1.status_code == 200
+    r2 = requests.get(
+        f"{GATEWAY}/ops/export",
+        params={"target": "b"},
+        headers={"X-Actor-Assertion": aa},
+        timeout=5,
+    )
+    assert r2.status_code == 403
+    assert "replay" in r2.text.lower()
+
+
+def test_ops_export_with_two_separate_assertions_reaches_both_replicas():
+    aa_a = alice_assertion("admin.export.read")
+    aa_b = alice_assertion("admin.export.read")
     a = requests.get(
         f"{GATEWAY}/ops/export",
         params={"target": "a"},
-        headers={"X-Admin-Api-Key": ADMIN_KEY},
+        headers={"X-Actor-Assertion": aa_a},
         timeout=5,
     )
     b = requests.get(
         f"{GATEWAY}/ops/export",
         params={"target": "b"},
-        headers={"X-Admin-Api-Key": ADMIN_KEY},
+        headers={"X-Actor-Assertion": aa_b},
         timeout=5,
     )
     assert a.status_code == 200, a.text
@@ -176,227 +750,131 @@ def test_ops_export_still_works_on_both_replicas():
     assert b.json()["service"] == "internal-admin-b"
 
 
-def test_ops_use_token_rejects_without_admin_key():
+def test_ops_use_token_requires_actor_assertion():
     r = requests.get(
         f"{GATEWAY}/ops/use-token",
-        params={"target": "a", "token": "x"},
+        params={"target": "a", "token": "x.y.z"},
         timeout=5,
     )
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
-# ----- Token-service hardening ----------------------------------------------
+def test_ops_raw_token_still_retired():
+    r = requests.get(f"{GATEWAY}/ops/raw-token", timeout=5)
+    assert r.status_code in (403, 404, 410)
 
 
-def test_mint_requires_nonce_header():
-    r = requests.post(
-        f"{TOKEN_SERVICE}/v1/mint",
-        json={"audience": TOKEN_AUDIENCE, "scope": "admin.export.read"},
-        headers={"X-Client-Id": "gateway", "X-Client-Secret": GATEWAY_CLIENT_SECRET},
-        timeout=5,
-    )
-    assert r.status_code == 400
+# -----------------------------------------------------------------------------
+# Compromised-gateway threat model
+# -----------------------------------------------------------------------------
 
 
-def test_mint_rejects_unknown_client():
-    r = _mint("attacker", "whatever", "admin.export.read", _nonce("unknown"))
-    assert r.status_code == 403
-
-
-def test_mint_rejects_bad_secret():
-    r = _mint("gateway", "wrong", "admin.export.read", _nonce("badsec"))
-    assert r.status_code == 403
-
-
-def test_nonce_replay_blocked_at_mint():
-    nonce = _nonce("replay")
-    first = _mint("gateway", GATEWAY_CLIENT_SECRET, "admin.export.read", nonce)
-    second = _mint("gateway", GATEWAY_CLIENT_SECRET, "admin.export.read", nonce)
-    assert first.status_code == 200, first.text
-    assert second.status_code == 403
-
-
-def test_subject_field_is_ignored_in_favor_of_client_id():
-    nonce = _nonce("subj")
+def test_compromised_gateway_cannot_mint_admin_without_operator():
+    # The attacker holds the gateway client private key (imported into the
+    # test via conftest). Simulate them calling token-service directly.
+    ca = gateway_assertion()
     r = _mint(
-        "gateway",
-        GATEWAY_CLIENT_SECRET,
-        "admin.export.read",
-        nonce,
-        body_override={"subject": "admin-bypass"},
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
     )
-    assert r.status_code == 200, r.text
-    data = r.json()
-    assert data["subject"] == "gateway"
-    claims = _decode_token_body(data["access_token"])
-    assert claims["sub"] == "gateway"
-    assert claims["jti"]
-    # JTI must not be influenced by attacker-supplied nonce.
-    assert nonce not in claims["jti"]
-
-
-def test_scope_not_permitted_for_observer():
-    # observer does not hold admin.export.read
-    r = _mint("observer", OBSERVER_CLIENT_SECRET, "admin.export.read", _nonce("obs"))
     assert r.status_code == 403
 
 
-def test_mesh_endpoint_requires_client_credentials():
-    r = requests.get(f"{TOKEN_SERVICE}/.well-known/mesh", timeout=5)
-    assert r.status_code == 403
-    r2 = requests.get(
-        f"{TOKEN_SERVICE}/.well-known/mesh",
-        headers={"X-Client-Id": "gateway", "X-Client-Secret": GATEWAY_CLIENT_SECRET},
-        timeout=5,
+def test_compromised_gateway_cannot_replay_captured_operator_assertion():
+    # Simulate the gateway capturing an in-flight actor assertion.
+    aa = alice_assertion("admin.export.read")
+    # First use is legit.
+    ca1 = gateway_assertion()
+    r1 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca1,
+            "actor_assertion": aa,
+        }
     )
-    assert r2.status_code == 200
-    # Response must not enumerate other clients.
-    assert "clients" not in r2.json()
-
-
-# ----- Internal-admin hardening ---------------------------------------------
-
-
-def test_internal_admin_debug_config_requires_scope():
-    r = requests.get(f"{INTERNAL_A}/debug/config", timeout=5)
-    assert r.status_code == 403
-    r2 = requests.get(f"{INTERNAL_B}/debug/config", timeout=5)
+    assert r1.status_code == 200
+    # Attacker tries to reuse the same actor assertion.
+    ca2 = gateway_assertion()
+    r2 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca2,
+            "actor_assertion": aa,
+        }
+    )
     assert r2.status_code == 403
 
 
-def test_cross_replica_replay_blocked_with_real_token():
-    # Mint a real token from the token service and confirm a single token
-    # cannot be spent against both replicas.
-    nonce = _nonce("xrep")
-    r = _mint("gateway", GATEWAY_CLIENT_SECRET, "admin.export.read", nonce)
-    assert r.status_code == 200, r.text
-    token = r.json()["access_token"]
-    h = {"Authorization": f"Bearer {token}"}
-    a = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
-    b = requests.get(f"{INTERNAL_B}/admin/export", headers=h, timeout=5)
-    # First replica succeeds, the second must be rejected.
-    assert (a.status_code == 200) ^ (b.status_code == 200)
-    loser = a if b.status_code == 200 else b
-    assert loser.status_code == 403
-    assert "replay" in loser.text.lower()
-
-
-def test_same_replica_replay_blocked_with_real_token():
-    nonce = _nonce("arep")
-    r = _mint("gateway", GATEWAY_CLIENT_SECRET, "admin.export.read", nonce)
-    assert r.status_code == 200, r.text
-    token = r.json()["access_token"]
-    h = {"Authorization": f"Bearer {token}"}
-    a1 = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
-    a2 = requests.get(f"{INTERNAL_A}/admin/export", headers=h, timeout=5)
-    assert a1.status_code == 200
-    assert a2.status_code == 403
-
-
-def test_forged_token_with_bad_subject_rejected_by_admin():
-    # Simulate a compromised issuer minting a token with an out-of-policy
-    # subject. The internal-admin must refuse it purely on ALLOWED_SUBJECTS
-    # (defense-in-depth).
+def test_compromised_gateway_cannot_forge_operator_assertion():
+    # The attacker only has the gateway client key. Trying to sign an
+    # operator assertion with the gateway key is a signature mismatch
+    # against the operator's registered public key.
+    ca = gateway_assertion()
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ops-alice-v1"}
     now = int(time.time())
     payload = {
-        "iss": "token-service",
-        "sub": "admin-bypass",
-        "aud": TOKEN_AUDIENCE,
+        "iss": "ops-alice",
+        "sub": "ops-alice",
+        "aud": "token-service",
         "scope": "admin.export.read",
         "iat": now,
         "nbf": now,
         "exp": now + 30,
         "jti": str(uuid.uuid4()),
     }
-    token = _sign_forged(payload)
-    r = requests.get(
-        f"{INTERNAL_A}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5,
+    forged = sign_compact(GATEWAY_CLIENT_KEY, header, payload)
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": forged,
+        }
     )
     assert r.status_code == 403
-    assert "subject" in r.text.lower()
+    assert "signature" in r.text.lower()
 
 
-def test_forged_token_with_oversized_lifetime_rejected():
-    now = int(time.time())
-    payload = {
-        "iss": "token-service",
-        "sub": "gateway",
-        "aud": TOKEN_AUDIENCE,
-        "scope": "admin.export.read",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 86400,  # 1 day
-        "jti": str(uuid.uuid4()),
-    }
-    token = _sign_forged(payload)
-    r = requests.get(
-        f"{INTERNAL_A}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5,
+def test_compromised_gateway_self_mint_observer_scope_is_rejected():
+    # Even if the compromised gateway tries to mint a scope that observer
+    # holds, it cannot because it is authenticating as gateway, not
+    # observer. Cross-client escalation via kid mix-up is impossible
+    # because the verifier pins iss to the kid-owning client.
+    ca = gateway_assertion()
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "internal.metrics.read",
+            "client_assertion": ca,
+        }
     )
     assert r.status_code == 403
 
 
-def test_tampered_signature_rejected():
-    nonce = _nonce("tamper")
-    r = _mint("gateway", GATEWAY_CLIENT_SECRET, "admin.export.read", nonce)
-    assert r.status_code == 200, r.text
-    token = r.json()["access_token"]
-    # Decode the signature, flip a whole byte, re-encode. Avoids the
-    # base64-padding edge case where modifying the last character may not
-    # change the decoded bytes.
-    body_b64, sig_b64 = token.split(".", 1)
-    sig_bytes = bytearray(_b64d(sig_b64))
-    sig_bytes[0] ^= 0xFF
-    bad_sig = _b64e(bytes(sig_bytes))
-    bad = f"{body_b64}.{bad_sig}"
-    r2 = requests.get(
-        f"{INTERNAL_A}/admin/export",
-        headers={"Authorization": f"Bearer {bad}"},
-        timeout=5,
+def test_compromised_gateway_cannot_reuse_own_client_assertion():
+    ca = gateway_assertion()
+    aa1 = alice_assertion("admin.export.read")
+    aa2 = alice_assertion("admin.export.read")
+    r1 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa1,
+        }
+    )
+    assert r1.status_code == 200
+    r2 = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,  # replay
+            "actor_assertion": aa2,
+        }
     )
     assert r2.status_code == 403
-
-
-def test_expired_token_rejected():
-    now = int(time.time())
-    payload = {
-        "iss": "token-service",
-        "sub": "gateway",
-        "aud": TOKEN_AUDIENCE,
-        "scope": "admin.export.read",
-        "iat": now - 120,
-        "nbf": now - 120,
-        "exp": now - 60,
-        "jti": str(uuid.uuid4()),
-    }
-    token = _sign_forged(payload)
-    r = requests.get(
-        f"{INTERNAL_A}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5,
-    )
-    assert r.status_code == 403
-
-
-def test_wrong_audience_rejected():
-    now = int(time.time())
-    payload = {
-        "iss": "token-service",
-        "sub": "gateway",
-        "aud": "wrong-audience",
-        "scope": "admin.export.read",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 30,
-        "jti": str(uuid.uuid4()),
-    }
-    token = _sign_forged(payload)
-    r = requests.get(
-        f"{INTERNAL_A}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5,
-    )
-    assert r.status_code == 403

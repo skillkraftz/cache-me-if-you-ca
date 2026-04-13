@@ -1,13 +1,21 @@
 from flask import Flask, jsonify, request
 import os
+import time
+import json
+import uuid
+import base64
 import socket
 import ipaddress
+
 import requests
 from urllib.parse import urlparse, urlunparse
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
 app = Flask(__name__)
+
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3"))
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "lab-admin-key")
 TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "http://token-service:5003")
 INTERNAL_ADMIN_A_URL = os.getenv("INTERNAL_ADMIN_A_URL", "http://internal-admin-a:5001")
 INTERNAL_ADMIN_B_URL = os.getenv("INTERNAL_ADMIN_B_URL", "http://internal-admin-b:5001")
@@ -15,31 +23,66 @@ ALLOWED_PROXY_URLS = {
     u.strip() for u in os.getenv("ALLOWED_PROXY_URLS", "").split(",") if u.strip()
 }
 GATEWAY_CLIENT_ID = os.getenv("GATEWAY_CLIENT_ID", "gateway")
-GATEWAY_CLIENT_SECRET = os.getenv("GATEWAY_CLIENT_SECRET", "gateway-client-secret")
+GATEWAY_CLIENT_KEY_ID = os.getenv("GATEWAY_CLIENT_KEY_ID", "gateway-client-v1")
+GATEWAY_CLIENT_KEY_SEED_B64 = os.environ["GATEWAY_CLIENT_KEY_SEED_B64"]
+CLIENT_ASSERTION_LIFETIME_SECONDS = int(
+    os.getenv("CLIENT_ASSERTION_LIFETIME_SECONDS", "30")
+)
 
 
-def _admin_target(name: str) -> str:
-    # Strictly allow only the two known replica names. Unknown names refuse.
-    if name == "a":
-        return INTERNAL_ADMIN_A_URL
-    if name == "b":
-        return INTERNAL_ADMIN_B_URL
-    return ""
+# -----------------------------------------------------------------------------
+# Crypto helpers (inlined)
+# -----------------------------------------------------------------------------
 
 
-def _admin_ok() -> bool:
-    import hmac
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
-    supplied = request.headers.get("X-Admin-Api-Key", "") or ""
-    return hmac.compare_digest(supplied, ADMIN_API_KEY)
+
+def _b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _load_private(seed_b64: str) -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(_b64d(seed_b64))
+
+
+def _sign_compact(priv: Ed25519PrivateKey, header: dict, payload: dict) -> str:
+    h_b64 = _b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    p_b64 = _b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    sig = priv.sign(signing_input)
+    return f"{h_b64}.{p_b64}.{_b64e(sig)}"
+
+
+GATEWAY_CLIENT_KEY = _load_private(GATEWAY_CLIENT_KEY_SEED_B64)
+
+
+def _gateway_client_assertion() -> str:
+    """Mint a fresh client assertion attesting 'this request is from the
+    gateway'. Short-lived and single-use: the token-service claims the jti
+    in Redis so the assertion cannot be replayed.
+    """
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": "JWT", "kid": GATEWAY_CLIENT_KEY_ID}
+    payload = {
+        "iss": GATEWAY_CLIENT_ID,
+        "sub": GATEWAY_CLIENT_ID,
+        "aud": "token-service",
+        "iat": now,
+        "nbf": now,
+        "exp": now + CLIENT_ASSERTION_LIFETIME_SECONDS,
+        "jti": str(uuid.uuid4()),
+    }
+    return _sign_compact(GATEWAY_CLIENT_KEY, header, payload)
+
+
+# -----------------------------------------------------------------------------
+# SSRF-safe fetch helpers (kept from the previous turn)
+# -----------------------------------------------------------------------------
 
 
 def _resolve_and_validate(host: str):
-    """Resolve hostname to IPs and require every answer to be a globally
-    routable public address. Returns (list_of_(family, ip), None) on success
-    or (None, reason) on failure. Any non-public address (private, loopback,
-    link-local, reserved, multicast, unspecified) causes rejection.
-    """
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except Exception:
@@ -69,27 +112,14 @@ def _resolve_and_validate(host: str):
 
 
 def _safe_fetch(target_url: str):
-    """Validate the URL and perform a safe HTTP GET that:
-    - rejects non-http(s) schemes
-    - rejects URLs containing userinfo
-    - rejects hosts that resolve to any non-public address
-    - disables redirect following (redirects are refused explicitly)
-    - DNS-pins HTTP requests to the validated IP to defeat rebinding
-
-    Returns (requests.Response, None) on success or
-    (None, (error_message, http_status)) on rejection / transport error.
-    """
     parsed = urlparse(target_url)
     if parsed.scheme not in ("http", "https"):
         return None, ("unsupported scheme", 400)
-    # Any embedded credentials indicate an attempt to smuggle a netloc past
-    # naive blocklists; refuse unconditionally.
     if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
         return None, ("userinfo not allowed", 400)
     host = parsed.hostname
     if not host:
         return None, ("missing host", 400)
-    # Validate port bounds early.
     try:
         raw_port = parsed.port
     except ValueError:
@@ -105,8 +135,6 @@ def _safe_fetch(target_url: str):
             pinned_netloc = f"[{ip}]:{port}"
         else:
             pinned_netloc = f"{ip}:{port}"
-        # Preserve the original Host header so virtual-hosted servers
-        # continue to route correctly.
         if raw_port and raw_port != 80:
             host_header = f"{host}:{raw_port}"
         else:
@@ -131,12 +159,6 @@ def _safe_fetch(target_url: str):
         except Exception as e:
             return None, (str(e), 502)
     else:
-        # HTTPS path preserves SNI / certificate validation by keeping the
-        # hostname. The IP allowlist still applied above, so the primary
-        # SSRF vectors (internal hostnames, loopback, metadata IPs) are
-        # already rejected. DNS rebinding inside the request window is a
-        # residual risk that is mitigated by short timeouts and by the
-        # fact that we refuse all redirects.
         try:
             r = requests.get(
                 target_url,
@@ -149,6 +171,77 @@ def _safe_fetch(target_url: str):
     if 300 <= r.status_code < 400:
         return None, ("redirects are not permitted", 403)
     return r, None
+
+
+# -----------------------------------------------------------------------------
+# Admin target mapping
+# -----------------------------------------------------------------------------
+
+
+def _admin_target(name: str) -> str:
+    if name == "a":
+        return INTERNAL_ADMIN_A_URL
+    if name == "b":
+        return INTERNAL_ADMIN_B_URL
+    return ""
+
+
+# -----------------------------------------------------------------------------
+# Operator actor-assertion plumbing
+# -----------------------------------------------------------------------------
+
+
+def _require_actor_assertion():
+    """Every /ops/* endpoint requires an X-Actor-Assertion header. The
+    gateway does NOT trust or verify the assertion itself - it merely
+    checks that one is present, bounds its size, and forwards it to the
+    token-service which is the single authority. This keeps the gateway
+    stateless with respect to operator identity: a compromised gateway
+    still cannot forge operator actions because it never holds operator
+    private key material.
+    """
+    assertion = request.headers.get("X-Actor-Assertion", "") or ""
+    if not assertion:
+        return None, (jsonify({"error": "missing X-Actor-Assertion"}), 401)
+    if len(assertion) > 4096:
+        return None, (jsonify({"error": "oversize X-Actor-Assertion"}), 400)
+    if assertion.count(".") != 2:
+        return None, (jsonify({"error": "malformed X-Actor-Assertion"}), 400)
+    return assertion, None
+
+
+def _mint_delegated_token(actor_assertion: str, scope: str):
+    """Call token-service /v1/mint presenting the gateway's fresh client
+    assertion plus the operator's actor assertion. Returns
+    (token, None) or (None, (response, status)).
+    """
+    client_assertion = _gateway_client_assertion()
+    body = {
+        "audience": "internal-admin",
+        "scope": scope,
+        "client_assertion": client_assertion,
+        "actor_assertion": actor_assertion,
+    }
+    try:
+        r = requests.post(
+            f"{TOKEN_SERVICE_URL}/v1/mint",
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        return None, (jsonify({"error": f"token service unreachable: {e}"}), 502)
+    if r.status_code != 200:
+        return None, (r.text, r.status_code)
+    try:
+        return r.json()["access_token"], None
+    except Exception:
+        return None, (jsonify({"error": "malformed mint response"}), 502)
+
+
+# -----------------------------------------------------------------------------
+# HTTP routes
+# -----------------------------------------------------------------------------
 
 
 @app.get("/health")
@@ -178,7 +271,9 @@ def fetch():
 @app.get("/proxy-health")
 def proxy_health():
     r = requests.get(
-        f"{INTERNAL_ADMIN_A_URL}/health", timeout=REQUEST_TIMEOUT, allow_redirects=False
+        f"{INTERNAL_ADMIN_A_URL}/health",
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     try:
         body = r.json()
@@ -202,25 +297,27 @@ def proxy_allowlisted():
 
 @app.get("/ops/raw-token")
 def raw_token():
-    # Retired. This helper previously allowed any caller with the admin
-    # API key to request a mint with an attacker-controlled subject, nonce,
-    # and scope, and then receive the raw bearer back. That is a classic
-    # confused-deputy pattern and is disabled. Use /ops/export for the
-    # legitimate mint-and-use flow.
+    # Retired endpoint (previous turn). The confused-deputy pattern is
+    # gone and actor-assertion flow replaces the whole "mint and hand a
+    # bearer to the caller" idea.
     return jsonify({"error": "endpoint retired"}), 410
 
 
 @app.get("/ops/use-token")
 def use_token():
-    if not _admin_ok():
-        return jsonify({"error": "forbidden"}), 403
+    # This helper now requires an operator actor assertion. It is no
+    # longer authenticated by any static admin key. The supplied bearer is
+    # passed through to the admin replica as before.
+    _assertion, err = _require_actor_assertion()
+    if err:
+        return err
     token = request.args.get("token", "") or ""
     target = request.args.get("target", "a")
     base = _admin_target(target)
     if not base:
         return jsonify({"error": "unknown target"}), 400
-    if not token:
-        return jsonify({"error": "missing token"}), 400
+    if not token or token.count(".") != 2:
+        return jsonify({"error": "missing or malformed token"}), 400
     r = requests.get(
         f"{base}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
@@ -236,43 +333,19 @@ def use_token():
 
 @app.get("/ops/export")
 def export():
-    if not _admin_ok():
-        return jsonify({"error": "forbidden"}), 403
+    assertion, err = _require_actor_assertion()
+    if err:
+        return err
     target = request.args.get("target", "a")
     base = _admin_target(target)
     if not base:
         return jsonify({"error": "unknown target"}), 400
-    # Generate a fresh per-request nonce server-side so attackers can never
-    # inject a deterministic one via the request.
-    import uuid
-
-    nonce = f"gw-{uuid.uuid4()}"
-    headers = {
-        "X-Client-Id": GATEWAY_CLIENT_ID,
-        "X-Client-Secret": GATEWAY_CLIENT_SECRET,
-        "X-Nonce": nonce,
-    }
-    mint = requests.post(
-        f"{TOKEN_SERVICE_URL}/v1/mint",
-        json={
-            "audience": "internal-admin",
-            "scope": "admin.export.read",
-            "subject": GATEWAY_CLIENT_ID,
-        },
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
-        allow_redirects=False,
-    )
-    if mint.status_code != 200:
-        return (
-            mint.text,
-            mint.status_code,
-            {"Content-Type": mint.headers.get("Content-Type", "application/json")},
-        )
-    try:
-        token = mint.json()["access_token"]
-    except Exception:
-        return jsonify({"error": "malformed mint response"}), 502
+    token, mint_err = _mint_delegated_token(assertion, "admin.export.read")
+    if mint_err:
+        body, status = mint_err
+        if isinstance(body, str):
+            return (body, status, {"Content-Type": "application/json"})
+        return body, status
     r = requests.get(
         f"{base}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
