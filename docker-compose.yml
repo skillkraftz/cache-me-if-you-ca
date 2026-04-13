@@ -55,7 +55,6 @@ services:
     environment:
       APP_ENV: dev
       REDIS_URL: redis://redis:6379/0
-      STRICT_REDIS: "false"
       TOKEN_AUDIENCE: internal-admin
       ACCESS_TOKEN_SECRET: lab-access-token-secret
       NONCE_TTL_SECONDS: "60"
