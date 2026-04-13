@@ -151,13 +151,21 @@ OPERATORS = {
         "pub_by_kid": {
             _kid_for("ops-alice"): _load_public(os.environ["OPS_ALICE_PUB_KEY_B64"]),
         },
-        "scopes": {"admin.export.read", "internal.metrics.read", "debug.config.read"},
+        "scopes": {
+            "admin.export.read",
+            "internal.metrics.read",
+            "debug.config.read",
+            # audit.self.read lets the operator pull their own request
+            # log from internal-admin and reconcile it against their own
+            # local ledger to detect gateway-side suppression.
+            "audit.self.read",
+        },
     },
     "ops-bob": {
         "pub_by_kid": {
             _kid_for("ops-bob"): _load_public(os.environ["OPS_BOB_PUB_KEY_B64"]),
         },
-        "scopes": {"admin.export.read"},
+        "scopes": {"admin.export.read", "audit.self.read"},
     },
 }
 

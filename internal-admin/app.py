@@ -60,9 +60,18 @@ ALLOWED_ACTORS = {"gateway"}
 
 SUBJECT_SCOPE_POLICY = {
     "observer": {"internal.metrics.read", "debug.config.read", "token.discovery"},
-    "ops-alice": {"admin.export.read", "internal.metrics.read", "debug.config.read"},
-    "ops-bob": {"admin.export.read"},
+    "ops-alice": {
+        "admin.export.read",
+        "internal.metrics.read",
+        "debug.config.read",
+        "audit.self.read",
+    },
+    "ops-bob": {"admin.export.read", "audit.self.read"},
 }
+
+AUDIT_RETENTION_SECONDS = int(os.getenv("AUDIT_RETENTION_SECONDS", "3600"))
+AUDIT_QUERY_DEFAULT_WINDOW = int(os.getenv("AUDIT_QUERY_DEFAULT_WINDOW", "900"))
+AUDIT_QUERY_MAX_ENTRIES = int(os.getenv("AUDIT_QUERY_MAX_ENTRIES", "500"))
 
 TYP_ACCESS_TOKEN = "at+jwt"
 TYP_RESPONSE_ENVELOPE = "ar+jwt"  # "admin response"
@@ -148,6 +157,54 @@ def _claim_jti(jti: str) -> bool:
     except Exception:
         raise ReplayBackendUnavailable()
     return bool(ok)
+
+
+def _audit_key(subject: str) -> str:
+    return f"audit:op:{subject}"
+
+
+def _record_audit(subject: str, entry: dict) -> None:
+    """Append an audit record for this operator to Redis.
+
+    Storage is a sorted set keyed by the operator subject and scored by
+    iat, so we can query by time window and trim old records. The entry
+    itself is the serialized JSON so we get free dedup-by-content.
+
+    Fail-closed: if the audit backend cannot confirm the write, the
+    caller must refuse the request. Otherwise the operator would see a
+    successful response but find no audit entry for it on reconcile,
+    triggering a false suppression alarm.
+    """
+    try:
+        r = _redis()
+        key = _audit_key(subject)
+        payload = json.dumps(entry, separators=(",", ":"), sort_keys=True)
+        now = int(time.time())
+        pipe = r.pipeline()
+        pipe.zadd(key, {payload: now})
+        pipe.zremrangebyscore(key, "-inf", now - AUDIT_RETENTION_SECONDS)
+        pipe.expire(key, AUDIT_RETENTION_SECONDS * 2)
+        pipe.execute()
+    except Exception:
+        raise ReplayBackendUnavailable()
+
+
+def _fetch_audit(subject: str, since: int):
+    try:
+        r = _redis()
+        key = _audit_key(subject)
+        raw = r.zrangebyscore(
+            key, min=since, max="+inf", start=0, num=AUDIT_QUERY_MAX_ENTRIES
+        )
+    except Exception:
+        raise ReplayBackendUnavailable()
+    out = []
+    for item in raw:
+        try:
+            out.append(json.loads(item))
+        except Exception:
+            continue
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -364,6 +421,33 @@ def _envelope_metadata(payload):
     )
 
 
+def _audit_write_or_refuse(payload, status: int):
+    """Record an audit entry for a successfully authorized request.
+    Returns None on success, or a fail-closed envelope error response on
+    Redis failure. The caller MUST return that response to the caller if
+    it is non-None, otherwise the operation would succeed without being
+    audited and the operator's reconcile check would raise a false
+    suppression alarm.
+    """
+    subject = payload.get("sub", "")
+    actor_jti = payload.get("act_jti", "") or ""
+    entry = {
+        "iat": int(time.time()),
+        "endpoint": request.path,
+        "scope": payload.get("scope", ""),
+        "subject": subject,
+        "actor_jti": actor_jti,
+        "token_jti": payload.get("jti", ""),
+        "status": status,
+        "replica": REPLICA_NAME,
+    }
+    try:
+        _record_audit(subject, entry)
+    except ReplayBackendUnavailable:
+        return _envelope_error("audit store unavailable", 503)
+    return None
+
+
 # -----------------------------------------------------------------------------
 # HTTP routes
 # -----------------------------------------------------------------------------
@@ -379,6 +463,9 @@ def debug_config():
     payload, err = require_scope("debug.config.read")
     if err:
         return err
+    fail = _audit_write_or_refuse(payload, 200)
+    if fail is not None:
+        return fail
     subject, scope, actor_jti = _envelope_metadata(payload)
     body = {
         "service": REPLICA_NAME,
@@ -398,6 +485,9 @@ def metrics():
     payload, err = require_scope("internal.metrics.read")
     if err:
         return err
+    fail = _audit_write_or_refuse(payload, 200)
+    if fail is not None:
+        return fail
     subject, scope, actor_jti = _envelope_metadata(payload)
     body = {
         "service": REPLICA_NAME,
@@ -416,6 +506,9 @@ def export():
     payload, err = require_scope("admin.export.read")
     if err:
         return err
+    fail = _audit_write_or_refuse(payload, 200)
+    if fail is not None:
+        return fail
     subject, scope, actor_jti = _envelope_metadata(payload)
     body = {
         "service": REPLICA_NAME,
@@ -429,6 +522,61 @@ def export():
     }
     return _envelope_response(
         body, 200, subject=subject, scope=scope, actor_jti=actor_jti
+    )
+
+
+@app.get("/internal/audit")
+def audit_self():
+    """Return the caller's own recent audit entries. The operator cross-
+    checks the returned list against their local ledger to detect
+    gateway-side suppression. The response itself is envelope-signed like
+    every other scoped endpoint, so a relay cannot forge or prune it
+    without detection.
+
+    Accepts an optional ?since=<iat> parameter bounded to a reasonable
+    window. Absent or malformed ?since=... falls back to the default
+    window. A caller can only ever see their OWN log - the subject of
+    the log query is pinned to the token subject, never from a URL
+    parameter.
+    """
+    payload, err = require_scope("audit.self.read")
+    if err:
+        return err
+    # This endpoint writes its own audit entry so reconcile() can see that
+    # the audit query itself happened. Audit-of-audit prevents the gateway
+    # from dropping audit queries without a corresponding gap appearing in
+    # a subsequent audit.
+    fail = _audit_write_or_refuse(payload, 200)
+    if fail is not None:
+        return fail
+
+    now = int(time.time())
+    try:
+        since_raw = int(request.args.get("since", ""))
+    except (TypeError, ValueError):
+        since_raw = now - AUDIT_QUERY_DEFAULT_WINDOW
+    # Clamp: never look further back than retention allows, never look
+    # into the future.
+    since = max(since_raw, now - AUDIT_RETENTION_SECONDS)
+    since = min(since, now)
+
+    subject = payload.get("sub", "")
+    try:
+        entries = _fetch_audit(subject, since)
+    except ReplayBackendUnavailable:
+        return _envelope_error("audit store unavailable", 503)
+
+    subject_m, scope_m, actor_jti = _envelope_metadata(payload)
+    body = {
+        "service": REPLICA_NAME,
+        "caller": subject,
+        "since": since,
+        "now": now,
+        "count": len(entries),
+        "entries": entries,
+    }
+    return _envelope_response(
+        body, 200, subject=subject_m, scope=scope_m, actor_jti=actor_jti
     )
 
 

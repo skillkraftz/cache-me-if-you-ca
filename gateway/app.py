@@ -323,32 +323,40 @@ def use_token():
     return jsonify({"error": "endpoint retired"}), 410
 
 
-@app.get("/ops/export")
-def export():
-    assertion, err = _require_actor_assertion()
-    if err:
-        return err
+def _relay_to_admin(
+    assertion: str, scope: str, upstream_path: str, *, forward_params=()
+):
+    """Shared plumbing for /ops/* endpoints that relay to internal-admin.
+
+    Performs the delegated mint, forwards the operator's request nonce
+    upstream, calls internal-admin, and returns the response verbatim
+    with the X-Response-Envelope header intact. The gateway is a
+    transparent transport: it cannot meaningfully tamper with the body
+    without invalidating the envelope body hash, nor with the envelope
+    without invalidating the signature.
+    """
     target = request.args.get("target", "a")
     base = _admin_target(target)
     if not base:
         return jsonify({"error": "unknown target"}), 400
-    token, mint_err = _mint_delegated_token(assertion, "admin.export.read")
+    token, mint_err = _mint_delegated_token(assertion, scope)
     if mint_err:
         body, status = mint_err
         if isinstance(body, str):
             return (body, status, {"Content-Type": "application/json"})
         return body, status
-    # Forward the operator's request nonce verbatim to internal-admin so
-    # the response envelope binds to it. The gateway is intentionally a
-    # transparent transport for nonce + envelope: it cannot meaningfully
-    # tamper with either without being detected by the operator.
     upstream_headers = {"Authorization": f"Bearer {token}"}
     nonce = request.headers.get("X-Request-Nonce")
     if nonce is not None:
         upstream_headers["X-Request-Nonce"] = nonce
+    upstream_params = {}
+    for key in forward_params:
+        if key in request.args:
+            upstream_params[key] = request.args[key]
     r = requests.get(
-        f"{base}/admin/export",
+        f"{base}{upstream_path}",
         headers=upstream_headers,
+        params=upstream_params,
         timeout=REQUEST_TIMEOUT,
         allow_redirects=False,
     )
@@ -359,6 +367,33 @@ def export():
     if envelope is not None:
         response_headers["X-Response-Envelope"] = envelope
     return (r.text, r.status_code, response_headers)
+
+
+@app.get("/ops/export")
+def export():
+    assertion, err = _require_actor_assertion()
+    if err:
+        return err
+    return _relay_to_admin(assertion, "admin.export.read", "/admin/export")
+
+
+@app.get("/ops/audit")
+def audit():
+    """Relay an operator's request for their own audit log. The operator
+    uses this to reconcile the requests they *think* they submitted
+    against the list of requests internal-admin actually processed. A
+    compromised gateway cannot meaningfully lie here: the response is
+    envelope-signed end-to-end and the operator verifies on receipt.
+    """
+    assertion, err = _require_actor_assertion()
+    if err:
+        return err
+    return _relay_to_admin(
+        assertion,
+        "audit.self.read",
+        "/internal/audit",
+        forward_params=("since",),
+    )
 
 
 if __name__ == "__main__":
