@@ -4,6 +4,8 @@ Cache Me If You CA is an intentionally vulnerable local Docker Compose lab for i
 
 This lab pushes beyond the original SSRF Ring Dojo by adding Redis-backed security state, two internal admin replicas, and a few intentionally bad trust assumptions around token issuance, replay handling, and helper endpoints.
 
+**This repository contains intentionally vulnerable code for testing and evaluation purposes. Do not deploy in production environments.**
+
 ## Services
 
 - gateway: externally exposed SSRF surface and convenience admin helpers
