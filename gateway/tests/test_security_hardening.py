@@ -30,11 +30,16 @@ from trust_helpers import (
     make_client_assertion,
     make_actor_assertion,
     sign_compact,
+    forge_issuer_token,
+    TYP_ACCESS_TOKEN,
+    TYP_CLIENT_AUTH,
+    TYP_ACTOR_AUTH,
     GATEWAY_CLIENT_KEY,
     OBSERVER_CLIENT_KEY,
     OPS_ALICE_KEY,
     OPS_BOB_KEY,
     ROGUE_KEY,
+    TOKEN_ISSUER_KEY,
 )
 
 
@@ -486,13 +491,11 @@ def test_same_replica_replay_blocked():
 
 
 def test_admin_rejects_token_signed_by_rogue_key():
-    # An attacker who somehow obtained a way to sign EdDSA tokens but with
-    # a different private key than the issuer must be rejected. This
-    # covers "what if token-service's secret leaked" in the old HMAC model
-    # -- in the asymmetric model, only token-service's private key can
-    # sign valid tokens, and the consumer's public key set is closed.
+    # An attacker with a different private key than the issuer must be
+    # rejected. Use the correct typ so the rejection path is the
+    # signature check, not the typ check.
     now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ts-v1"}  # legit kid
+    header = {"alg": "EdDSA", "typ": TYP_ACCESS_TOKEN, "kid": "ts-v1"}
     payload = {
         "iss": "token-service",
         "sub": "ops-alice",
@@ -515,31 +518,12 @@ def test_admin_rejects_token_signed_by_rogue_key():
 
 
 def test_admin_rejects_token_with_unknown_kid():
-    # Legit issuer, different kid (simulating a key rotation where only
-    # the old kid is pinned on the consumer).
-    import os
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-        Ed25519PrivateKey,
+    token = forge_issuer_token(
+        sub="ops-alice",
+        scope="admin.export.read",
+        kid="unknown-kid",
+        act={"sub": "gateway"},
     )
-
-    # Load the real issuer seed from the lab so the signature would be
-    # cryptographically valid, but advertise an unknown kid. The consumer
-    # trusts keys by kid, so this must be rejected.
-    issuer_seed = "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
-    priv = Ed25519PrivateKey.from_private_bytes(b64d(issuer_seed))
-    now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "unknown-kid"}
-    payload = {
-        "iss": "token-service",
-        "sub": "ops-alice",
-        "aud": AUD_INTERNAL,
-        "scope": "admin.export.read",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 30,
-        "jti": str(uuid.uuid4()),
-    }
-    token = sign_compact(priv, header, payload)
     r = requests.get(
         f"{INTERNAL_A}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
@@ -550,31 +534,13 @@ def test_admin_rejects_token_with_unknown_kid():
 
 
 def test_admin_rejects_token_with_bad_actor_sub():
-    # Valid token signature (via the normal mint path), but the actor
-    # claim points at a client that is not in ALLOWED_ACTORS. We can't
-    # actually produce such a token through the legit mint (the mint
-    # always sets act.sub to the relaying client), so we craft it using
-    # the real signing key via the lab's known seed.
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-        Ed25519PrivateKey,
+    # Valid signature, but act.sub is not in ALLOWED_ACTORS. Must fail on
+    # consumer-side actor allowlist.
+    token = forge_issuer_token(
+        sub="ops-alice",
+        scope="admin.export.read",
+        act={"sub": "observer"},
     )
-
-    issuer_seed = "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
-    priv = Ed25519PrivateKey.from_private_bytes(b64d(issuer_seed))
-    now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ts-v1"}
-    payload = {
-        "iss": "token-service",
-        "sub": "ops-alice",
-        "aud": AUD_INTERNAL,
-        "scope": "admin.export.read",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 30,
-        "jti": str(uuid.uuid4()),
-        "act": {"sub": "observer"},  # not an allowed actor
-    }
-    token = sign_compact(priv, header, payload)
     r = requests.get(
         f"{INTERNAL_A}/admin/export",
         headers={"Authorization": f"Bearer {token}"},
@@ -587,7 +553,7 @@ def test_admin_rejects_token_with_bad_actor_sub():
 def test_admin_rejects_alg_none_or_hmac():
     # RFC 8725 'alg' confusion - an attacker tries to downgrade from
     # EdDSA to HMAC-SHA256 or none. We never accept anything but EdDSA.
-    header = {"alg": "none", "typ": "JWT", "kid": "ts-v1"}
+    header = {"alg": "none", "typ": TYP_ACCESS_TOKEN, "kid": "ts-v1"}
     payload = {
         "iss": "token-service",
         "sub": "ops-alice",
@@ -597,6 +563,7 @@ def test_admin_rejects_alg_none_or_hmac():
         "nbf": int(time.time()),
         "exp": int(time.time()) + 30,
         "jti": str(uuid.uuid4()),
+        "act": {"sub": "gateway"},
     }
     h_b64 = b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
     p_b64 = b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
@@ -666,13 +633,11 @@ def test_ops_export_rejects_rogue_actor_assertion():
 
 
 def test_ops_export_rejects_observer_as_actor():
-    # Observer has a valid client assertion key but it is not an operator.
-    # We reuse the client assertion function by claiming operator_id the
-    # token-service doesn't know about via observer's key.
-    import uuid as _uuid
-
+    # Observer has a valid client-assertion key but is not an operator.
+    # Even with the correct actor-auth typ, the observer kid is not in
+    # OPERATORS so kid lookup fails.
     now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "observer-client-v1"}
+    header = {"alg": "EdDSA", "typ": TYP_ACTOR_AUTH, "kid": "observer-client-v1"}
     payload = {
         "iss": "observer",
         "sub": "observer",
@@ -681,7 +646,7 @@ def test_ops_export_rejects_observer_as_actor():
         "iat": now,
         "nbf": now,
         "exp": now + 30,
-        "jti": str(_uuid.uuid4()),
+        "jti": str(uuid.uuid4()),
     }
     aa = sign_compact(OBSERVER_CLIENT_KEY, header, payload)
     r = requests.get(
@@ -750,13 +715,44 @@ def test_ops_export_with_two_separate_assertions_reaches_both_replicas():
     assert b.json()["service"] == "internal-admin-b"
 
 
-def test_ops_use_token_requires_actor_assertion():
+def test_ops_use_token_is_retired():
+    # Previously /ops/use-token was a thin bearer proxy authenticated only
+    # by a (size+format)-checked X-Actor-Assertion header. That was a
+    # stolen-bearer smuggling primitive: any external attacker with a
+    # captured bearer and a literal "a.b.c" string could reach
+    # internal-admin via the gateway. The endpoint is now retired.
     r = requests.get(
         f"{GATEWAY}/ops/use-token",
         params={"target": "a", "token": "x.y.z"},
         timeout=5,
     )
-    assert r.status_code == 401
+    assert r.status_code in (404, 405, 410)
+
+
+def test_ops_use_token_retired_even_with_real_bearer():
+    # Mint a real delegated token (via the normal /v1/mint path). Then
+    # try to relay it through /ops/use-token: the attacker simulation is
+    # "I captured a real bearer; can I proxy it through the gateway?"
+    # The endpoint must refuse so this attack vector stays closed.
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 200
+    tok = r.json()["access_token"]
+    r2 = requests.get(
+        f"{GATEWAY}/ops/use-token",
+        params={"target": "a", "token": tok},
+        headers={"X-Actor-Assertion": alice_assertion("admin.export.read")},
+        timeout=5,
+    )
+    assert r2.status_code in (404, 405, 410)
 
 
 def test_ops_raw_token_still_retired():
@@ -812,10 +808,11 @@ def test_compromised_gateway_cannot_replay_captured_operator_assertion():
 
 def test_compromised_gateway_cannot_forge_operator_assertion():
     # The attacker only has the gateway client key. Trying to sign an
-    # operator assertion with the gateway key is a signature mismatch
-    # against the operator's registered public key.
+    # actor assertion with the gateway key under ops-alice's kid fails
+    # at signature verification against the operator's registered
+    # public key.
     ca = gateway_assertion()
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "ops-alice-v1"}
+    header = {"alg": "EdDSA", "typ": TYP_ACTOR_AUTH, "kid": "ops-alice-v1"}
     now = int(time.time())
     payload = {
         "iss": "ops-alice",
@@ -878,3 +875,276 @@ def test_compromised_gateway_cannot_reuse_own_client_assertion():
         }
     )
     assert r2.status_code == 403
+
+
+# -----------------------------------------------------------------------------
+# New: attacks fixed this turn
+# -----------------------------------------------------------------------------
+
+
+def test_unpinned_actor_assertion_rejected():
+    """An actor assertion with no `scope` claim must be rejected.
+    Without mandatory scope pinning, a single assertion would otherwise
+    act as proof-of-intent for the operator's entire entitlement set,
+    allowing a compromised relay to pick any scope.
+    """
+    ca = gateway_assertion()
+    aa = make_actor_assertion(
+        "ops-alice",
+        OPS_ALICE_KEY,
+        "ops-alice-v1",
+        scope=None,
+        omit_scope=True,
+    )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "pin" in r.text.lower() or "scope" in r.text.lower()
+
+
+def test_unpinned_actor_assertion_cannot_expand_scope_to_another_operator_held_scope():
+    """Confirmation of the original attack path. Alice holds
+    {admin.export.read, internal.metrics.read, debug.config.read}.
+    If Alice's tooling forgets to pin a scope, the relay could
+    previously pick any of the three. After the fix, the unpinned
+    assertion is useless.
+    """
+    for scope in ("admin.export.read", "internal.metrics.read", "debug.config.read"):
+        ca = gateway_assertion()
+        aa = make_actor_assertion(
+            "ops-alice",
+            OPS_ALICE_KEY,
+            "ops-alice-v1",
+            scope=None,
+            omit_scope=True,
+        )
+        r = _mint(
+            {
+                "audience": AUD_INTERNAL,
+                "scope": scope,
+                "client_assertion": ca,
+                "actor_assertion": aa,
+            }
+        )
+        assert r.status_code == 403, (scope, r.text)
+
+
+def test_compromised_relay_cannot_swap_scope_on_pinned_assertion():
+    """If alice pins scope=admin.export.read, the mint is bound to that
+    scope. A compromised relay cannot request a different scope and
+    re-use alice's proof.
+    """
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "internal.metrics.read",  # different from pinned
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "scope" in r.text.lower()
+
+
+def test_actor_assertion_cannot_pin_multiple_scopes():
+    """Defensive: space-separated multi-scope claim is explicitly
+    refused so the pinning contract stays unambiguous.
+    """
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read internal.metrics.read")
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+
+
+def test_client_assertion_with_actor_typ_rejected():
+    """typ confusion: send a client assertion with the actor-auth typ."""
+    ca = make_client_assertion(
+        "gateway",
+        GATEWAY_CLIENT_KEY,
+        "gateway-client-v1",
+        typ_override=TYP_ACTOR_AUTH,
+    )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+        }
+    )
+    assert r.status_code == 403
+    assert "typ" in r.text.lower()
+
+
+def test_actor_assertion_with_client_typ_rejected():
+    """typ confusion: send an actor assertion with the client-auth typ."""
+    ca = gateway_assertion()
+    aa = make_actor_assertion(
+        "ops-alice",
+        OPS_ALICE_KEY,
+        "ops-alice-v1",
+        "admin.export.read",
+        typ_override=TYP_CLIENT_AUTH,
+    )
+    r = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert r.status_code == 403
+    assert "typ" in r.text.lower()
+
+
+def test_access_token_with_client_typ_rejected_at_consumer():
+    """typ confusion: craft a bearer whose header typ is client-auth+jwt
+    (signed with the real issuer key). The consumer must refuse because
+    it only accepts at+jwt tokens.
+    """
+    token = forge_issuer_token(
+        sub="ops-alice",
+        scope="admin.export.read",
+        typ=TYP_CLIENT_AUTH,
+        act={"sub": "gateway"},
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "typ" in r.text.lower()
+
+
+def test_consumer_rejects_sub_gateway_token():
+    """The gateway is never a valid subject in the new trust model.
+    Even if a regression or issuer compromise produces a signed token
+    with sub=gateway, internal-admin must reject it on consumer-side
+    allowlist.
+    """
+    token = forge_issuer_token(
+        sub="gateway",
+        scope="admin.export.read",
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "subject" in r.text.lower()
+
+
+def test_consumer_rejects_out_of_policy_subject_scope():
+    """ops-bob is only entitled to admin.export.read in the consumer's
+    policy. A (forged or regressed) token pairing ops-bob with
+    debug.config.read must be refused at internal-admin, independent of
+    what the issuer allowed.
+    """
+    token = forge_issuer_token(
+        sub="ops-bob",
+        scope="debug.config.read",
+        act={"sub": "gateway"},
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/debug/config",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "entitled" in r.text.lower() or "scope" in r.text.lower()
+
+
+def test_consumer_rejects_observer_token_with_act_claim():
+    """Observer is a self-mint client with can_relay=False. A token
+    shaped as observer-sub + act={sub:gateway} should never exist. The
+    consumer rejects the shape mismatch as defense-in-depth against
+    issuer misbehavior.
+    """
+    token = forge_issuer_token(
+        sub="observer",
+        scope="debug.config.read",
+        act={"sub": "gateway"},
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/debug/config",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "act" in r.text.lower()
+
+
+def test_consumer_rejects_operator_token_without_act_claim():
+    """An ops-alice token with NO act claim is a shape error: alice is
+    never a self-minter. Reject even though the signature is valid.
+    """
+    token = forge_issuer_token(
+        sub="ops-alice",
+        scope="admin.export.read",
+        act=None,
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "act" in r.text.lower()
+
+
+def test_consumer_rejects_operator_token_with_non_relay_actor():
+    token = forge_issuer_token(
+        sub="ops-alice",
+        scope="admin.export.read",
+        act={"sub": "ops-bob"},
+    )
+    r = requests.get(
+        f"{INTERNAL_A}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert "actor" in r.text.lower()
+
+
+def test_ops_use_token_cannot_smuggle_real_bearer():
+    """End-to-end regression of the original stolen-bearer proxy bug:
+    even with a genuinely valid bearer, /ops/use-token must not relay
+    it. The endpoint is retired entirely.
+    """
+    ca = gateway_assertion()
+    aa = alice_assertion("admin.export.read")
+    m = _mint(
+        {
+            "audience": AUD_INTERNAL,
+            "scope": "admin.export.read",
+            "client_assertion": ca,
+            "actor_assertion": aa,
+        }
+    )
+    assert m.status_code == 200
+    tok = m.json()["access_token"]
+    r = requests.get(
+        f"{GATEWAY}/ops/use-token",
+        params={"target": "a", "token": tok},
+        headers={"X-Actor-Assertion": "a.b.c"},  # bogus, unchecked string
+        timeout=5,
+    )
+    assert r.status_code in (404, 405, 410)

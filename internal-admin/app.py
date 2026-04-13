@@ -34,15 +34,39 @@ for entry in os.getenv("TOKEN_VERIFY_KEYS", "").split(","):
 if not TOKEN_VERIFY_KEYS:
     raise RuntimeError("no TOKEN_VERIFY_KEYS configured; refusing to start")
 
-# Subjects we are willing to honour. This set is deliberately narrow and
-# lives at the consumer side so that even a compromised issuer cannot mint
-# an admin token for an arbitrary actor. Operators are included because
-# delegated tokens mint with sub=<operator> and act={sub: <relaying client>}.
-ALLOWED_SUBJECTS = {"gateway", "observer", "ops-alice", "ops-bob"}
-
-# Tokens that carry an "act" (actor) claim must have the actor sub inside
-# this set; this is the list of clients that are allowed to relay.
+# The subject policy below is the consumer's independent view of what a
+# valid token looks like. It does NOT defer to the issuer's entitlement
+# map. If the issuer is ever compromised or regresses, this is the last
+# line of defense.
+#
+# The split between OPERATOR_SUBJECTS and CLIENT_SUBJECTS encodes the
+# shape rule: delegated tokens minted through an operator carry
+# sub=<operator> and act={sub: <relaying client>}; self-minted tokens
+# (observer) carry sub=<client> and no act claim. Anything outside those
+# two shapes is rejected, regardless of signature.
+#
+# Critically, "gateway" is NOT a legitimate subject in the new trust
+# model. The gateway has no self-mint scopes and is only ever a relay in
+# act.sub. The gateway being present in the subject set previously meant
+# that any issuer regression minting a sub=gateway token would reopen
+# privilege escalation; we cut that at the consumer instead.
+CLIENT_SUBJECTS = {"observer"}
+OPERATOR_SUBJECTS = {"ops-alice", "ops-bob"}
+ALLOWED_SUBJECTS = CLIENT_SUBJECTS | OPERATOR_SUBJECTS
 ALLOWED_ACTORS = {"gateway"}
+
+# Per-subject scope allowlist. This is the consumer's pinned view of
+# which scopes a subject may ever hold. Even if the issuer mints a
+# token with an unexpected (subject, scope) pair - via compromise or bug
+# - the consumer refuses it here. This duplicates the token-service
+# policy deliberately.
+SUBJECT_SCOPE_POLICY = {
+    "observer": {"internal.metrics.read", "debug.config.read", "token.discovery"},
+    "ops-alice": {"admin.export.read", "internal.metrics.read", "debug.config.read"},
+    "ops-bob": {"admin.export.read"},
+}
+
+TYP_ACCESS_TOKEN = "at+jwt"
 
 
 # -----------------------------------------------------------------------------
@@ -54,7 +78,7 @@ def _b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def _verify_compact(pub_by_kid, token: str):
+def _verify_compact(pub_by_kid, token: str, expected_typ: str):
     if not token or token.count(".") != 2:
         return None, None, "bad token format"
     h_b64, p_b64, s_b64 = token.split(".", 2)
@@ -69,7 +93,7 @@ def _verify_compact(pub_by_kid, token: str):
         return None, None, "bad token structure"
     if header.get("alg") != "EdDSA":
         return None, None, "bad alg"
-    if header.get("typ") != "JWT":
+    if header.get("typ") != expected_typ:
         return None, None, "bad typ"
     kid = header.get("kid")
     pub = pub_by_kid.get(kid)
@@ -121,7 +145,7 @@ def _claim_jti(jti: str) -> bool:
 
 
 def verify_token(token: str):
-    _h, payload, err = _verify_compact(TOKEN_VERIFY_KEYS, token)
+    _h, payload, err = _verify_compact(TOKEN_VERIFY_KEYS, token, TYP_ACCESS_TOKEN)
     if err:
         return None, err
 
@@ -151,17 +175,31 @@ def verify_token(token: str):
     if subject not in ALLOWED_SUBJECTS:
         return None, "subject not permitted"
 
-    # If this is a delegated token (act claim), the actor must be in the
-    # allowed relay set. This is a second independent check: the issuer
-    # already vetted the actor, but the consumer also enforces its own
-    # policy on who may act on behalf of others.
+    # (sub, act) coherence. Operators must always carry an act claim
+    # naming a registered relaying client; clients (observer) must
+    # never carry one. A token whose shape contradicts its subject kind
+    # is suspicious regardless of signature validity.
     act = payload.get("act")
-    if act is not None:
+    if subject in OPERATOR_SUBJECTS:
         if not isinstance(act, dict):
-            return None, "bad act claim"
+            return None, "operator token missing act claim"
         actor_sub = act.get("sub")
         if actor_sub not in ALLOWED_ACTORS:
             return None, "actor not permitted"
+    else:  # CLIENT_SUBJECTS
+        if act is not None:
+            return None, "self-minted token must not carry act claim"
+
+    # Consumer-side subject/scope policy. This duplicates the issuer's
+    # entitlement map on purpose: it catches the case where the issuer
+    # is compromised or regressed into minting out-of-policy tokens.
+    scope_claim = payload.get("scope", "")
+    if not isinstance(scope_claim, str) or not scope_claim:
+        return None, "missing scope"
+    token_scopes = set(scope_claim.split())
+    policy = SUBJECT_SCOPE_POLICY.get(subject, set())
+    if not token_scopes.issubset(policy):
+        return None, "subject not entitled to scope"
 
     jti = payload.get("jti")
     if not isinstance(jti, str) or not jti:

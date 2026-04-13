@@ -55,6 +55,11 @@ def _pub_bytes(priv: Ed25519PrivateKey) -> bytes:
     )
 
 
+TYP_ACCESS_TOKEN = "at+jwt"
+TYP_CLIENT_AUTH = "client-auth+jwt"
+TYP_ACTOR_AUTH = "actor-auth+jwt"
+
+
 def _sign_compact(priv: Ed25519PrivateKey, header: dict, payload: dict) -> str:
     h_b64 = _b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
     p_b64 = _b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
@@ -63,10 +68,14 @@ def _sign_compact(priv: Ed25519PrivateKey, header: dict, payload: dict) -> str:
     return f"{h_b64}.{p_b64}.{_b64e(sig)}"
 
 
-def _verify_compact(pub_by_kid, token: str):
+def _verify_compact(pub_by_kid, token: str, expected_typ: str):
     """Verify a compact Ed25519-signed JWT-like token.
-    pub_by_kid is a mapping of kid -> Ed25519PublicKey. Returns
-    (header, payload, None) on success or (None, None, reason) on failure.
+    pub_by_kid is a mapping of kid -> Ed25519PublicKey. expected_typ is
+    the JOSE header typ value this call site expects; it is part of the
+    trust decision so client assertions, actor assertions, and access
+    tokens cannot be substituted for one another even if a kid is
+    accidentally reused. Returns (header, payload, None) on success or
+    (None, None, reason) on failure.
     """
     if not token or token.count(".") != 2:
         return None, None, "bad token format"
@@ -82,7 +91,7 @@ def _verify_compact(pub_by_kid, token: str):
         return None, None, "bad token structure"
     if header.get("alg") != "EdDSA":
         return None, None, "bad alg"
-    if header.get("typ") != "JWT":
+    if header.get("typ") != expected_typ:
         return None, None, "bad typ"
     kid = header.get("kid")
     pub = pub_by_kid.get(kid)
@@ -268,7 +277,7 @@ def _verify_client_assertion(assertion: str):
             break
     if matching_client is None or pub_by_kid is None:
         return None, None, "unknown client kid"
-    _h, payload, err = _verify_compact(pub_by_kid, assertion)
+    _h, payload, err = _verify_compact(pub_by_kid, assertion, TYP_CLIENT_AUTH)
     if err:
         return None, None, err
     err = _check_assertion_claims(payload, {matching_client}, int(time.time()))
@@ -282,7 +291,7 @@ def _verify_actor_assertion(assertion: str):
         return None, None, "bad actor assertion size"
     if assertion.count(".") != 2:
         return None, None, "bad actor assertion format"
-    h_b64, p_b64, _s = assertion.split(".", 2)
+    h_b64, _p, _s = assertion.split(".", 2)
     try:
         header = json.loads(_b64d(h_b64).decode())
     except Exception:
@@ -299,12 +308,20 @@ def _verify_actor_assertion(assertion: str):
             break
     if matching_op is None:
         return None, None, "unknown operator kid"
-    _h, payload, err = _verify_compact(pub_by_kid, assertion)
+    _h, payload, err = _verify_compact(pub_by_kid, assertion, TYP_ACTOR_AUTH)
     if err:
         return None, None, err
     err = _check_assertion_claims(payload, {matching_op}, int(time.time()))
     if err:
         return None, None, err
+    # Scope pinning is MANDATORY on actor assertions. An unpinned
+    # assertion would otherwise be a proof-of-intent for the operator's
+    # entire entitlement set, and a compromised relay could choose any
+    # scope the operator holds. Requiring a pinned scope makes each
+    # assertion a single-scope, single-shot capability.
+    scope_claim = payload.get("scope")
+    if not isinstance(scope_claim, str) or not scope_claim or " " in scope_claim:
+        return None, None, "actor assertion must pin a single scope"
     return matching_op, payload, None
 
 
@@ -385,23 +402,21 @@ def mint():
                 return jsonify({"error": "actor_assertion replay"}), 403
         except RedisUnavailable:
             return _fail_closed()
-        # Scope must be a scope the operator actually holds.
+        # Scope is mandatory on actor assertions (enforced by
+        # _verify_actor_assertion). Enforce strict pinning here: the
+        # pinned scope must equal the requested scope. No exceptions, no
+        # "if present" path. The operator's assertion is proof of intent
+        # for one specific scope.
+        if actor_payload["scope"] != requested_scope:
+            return jsonify({"error": "actor_assertion scope mismatch"}), 403
         permitted_scopes = OPERATORS[actor_id]["scopes"]
         effective_subject = actor_id
-
-        # If the actor assertion pinned a specific scope, it must match
-        # the requested scope. This binds the operator's permission to the
-        # actual action being requested and stops a compromised relay from
-        # swapping in a different scope.
-        pinned_scope = actor_payload.get("scope")
-        if pinned_scope and pinned_scope != requested_scope:
-            return jsonify({"error": "actor_assertion scope mismatch"}), 403
 
     if requested_scope not in permitted_scopes:
         return jsonify({"error": "scope not permitted"}), 403
 
     now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": SIGNING_KEY_ID}
+    header = {"alg": "EdDSA", "typ": TYP_ACCESS_TOKEN, "kid": SIGNING_KEY_ID}
     payload = {
         "iss": "token-service",
         "sub": effective_subject,

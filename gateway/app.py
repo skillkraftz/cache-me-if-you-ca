@@ -61,10 +61,16 @@ GATEWAY_CLIENT_KEY = _load_private(GATEWAY_CLIENT_KEY_SEED_B64)
 def _gateway_client_assertion() -> str:
     """Mint a fresh client assertion attesting 'this request is from the
     gateway'. Short-lived and single-use: the token-service claims the jti
-    in Redis so the assertion cannot be replayed.
+    in Redis so the assertion cannot be replayed. The typ header pins it
+    as a client-authentication artifact so it can never be mistaken for
+    an operator actor assertion or an access token.
     """
     now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": GATEWAY_CLIENT_KEY_ID}
+    header = {
+        "alg": "EdDSA",
+        "typ": "client-auth+jwt",
+        "kid": GATEWAY_CLIENT_KEY_ID,
+    }
     payload = {
         "iss": GATEWAY_CLIENT_ID,
         "sub": GATEWAY_CLIENT_ID,
@@ -305,30 +311,16 @@ def raw_token():
 
 @app.get("/ops/use-token")
 def use_token():
-    # This helper now requires an operator actor assertion. It is no
-    # longer authenticated by any static admin key. The supplied bearer is
-    # passed through to the admin replica as before.
-    _assertion, err = _require_actor_assertion()
-    if err:
-        return err
-    token = request.args.get("token", "") or ""
-    target = request.args.get("target", "a")
-    base = _admin_target(target)
-    if not base:
-        return jsonify({"error": "unknown target"}), 400
-    if not token or token.count(".") != 2:
-        return jsonify({"error": "missing or malformed token"}), 400
-    r = requests.get(
-        f"{base}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=REQUEST_TIMEOUT,
-        allow_redirects=False,
-    )
-    return (
-        r.text,
-        r.status_code,
-        {"Content-Type": r.headers.get("Content-Type", "application/json")},
-    )
+    # Retired (this turn). This endpoint was a thin passthrough that sent
+    # a caller-supplied bearer to internal-admin. Its local auth check
+    # (X-Actor-Assertion size+format only) never called the token-service
+    # and never verified the assertion's signature, so an external
+    # attacker holding any stolen bearer could proxy it into internal-
+    # admin with a literal "a.b.c" string as the header. The whole point
+    # of the new trust model is that the gateway should never forward an
+    # attacker-supplied bearer, so the endpoint is gone. Use /ops/export
+    # for the mint-and-use-atomically flow.
+    return jsonify({"error": "endpoint retired"}), 410
 
 
 @app.get("/ops/export")

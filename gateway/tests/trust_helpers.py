@@ -20,6 +20,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
+# JOSE typ values used everywhere in the trust model. These are the
+# single source of truth for tests; any assertion created via the helpers
+# below automatically uses the right one, and the "attack" helpers
+# deliberately use the wrong ones to prove confusion is rejected.
+TYP_ACCESS_TOKEN = "at+jwt"
+TYP_CLIENT_AUTH = "client-auth+jwt"
+TYP_ACTOR_AUTH = "actor-auth+jwt"
+
+
 def b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
@@ -51,11 +60,17 @@ OPS_BOB_SEED_B64 = "b3BzLWJvYjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
 # with this key must be rejected everywhere.
 ROGUE_SEED_B64 = "cm9ndWUtYXR0YWNrZXItMDAwMDAwMDAwMDAwMDAwMDA"
 
+# Legit issuer seed, mirrored from docker-compose. Tests use this to
+# forge tokens that *would* pass signature verification so we can prove
+# the consumer-side policy (allowlist, typ, sub-scope) catches them.
+TOKEN_ISSUER_SEED_B64 = "dG9rZW4tc2lnbmluZzAwMDAwMDAwMDAwMDAwMDAwMDA"
+
 GATEWAY_CLIENT_KEY = load_private_from_seed(GATEWAY_CLIENT_SEED_B64)
 OBSERVER_CLIENT_KEY = load_private_from_seed(OBSERVER_CLIENT_SEED_B64)
 OPS_ALICE_KEY = load_private_from_seed(OPS_ALICE_SEED_B64)
 OPS_BOB_KEY = load_private_from_seed(OPS_BOB_SEED_B64)
 ROGUE_KEY = load_private_from_seed(ROGUE_SEED_B64)
+TOKEN_ISSUER_KEY = load_private_from_seed(TOKEN_ISSUER_SEED_B64)
 
 
 def make_client_assertion(
@@ -69,9 +84,14 @@ def make_client_assertion(
     iat_offset: int = 0,
     sub_override: str | None = None,
     iss_override: str | None = None,
+    typ_override: str | None = None,
 ) -> str:
     now = int(time.time()) + iat_offset
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": kid}
+    header = {
+        "alg": "EdDSA",
+        "typ": typ_override or TYP_CLIENT_AUTH,
+        "kid": kid,
+    }
     payload = {
         "iss": iss_override or client_id,
         "sub": sub_override or client_id,
@@ -88,26 +108,33 @@ def make_actor_assertion(
     operator_id: str,
     priv: Ed25519PrivateKey,
     kid: str,
-    scope: str,
+    scope: str | None,
     *,
     aud: str = "token-service",
     lifetime: int = 30,
     jti: str | None = None,
     iat_offset: int = 0,
     extra_claims: dict | None = None,
+    typ_override: str | None = None,
+    omit_scope: bool = False,
 ) -> str:
     now = int(time.time()) + iat_offset
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": kid}
+    header = {
+        "alg": "EdDSA",
+        "typ": typ_override or TYP_ACTOR_AUTH,
+        "kid": kid,
+    }
     payload = {
         "iss": operator_id,
         "sub": operator_id,
         "aud": aud,
-        "scope": scope,
         "iat": now,
         "nbf": now,
         "exp": now + lifetime,
         "jti": jti or str(uuid.uuid4()),
     }
+    if not omit_scope:
+        payload["scope"] = scope
     if extra_claims:
         payload.update(extra_claims)
     return sign_compact(priv, header, payload)
@@ -133,12 +160,14 @@ def bob_assertion(scope: str, **kw) -> str:
     return make_actor_assertion("ops-bob", OPS_BOB_KEY, "ops-bob-v1", scope, **kw)
 
 
-def rogue_assertion_as(iss: str, scope: str | None = None, **kw) -> str:
+def rogue_assertion_as(
+    iss: str, scope: str | None = None, typ: str | None = None, **kw
+) -> str:
     """Assertion signed by an unknown-to-us key but claiming to come from a
     real issuer. These must always be rejected at verification time.
     """
     now = int(time.time())
-    header = {"alg": "EdDSA", "typ": "JWT", "kid": "rogue-v1"}
+    header = {"alg": "EdDSA", "typ": typ or TYP_ACTOR_AUTH, "kid": "rogue-v1"}
     payload = {
         "iss": iss,
         "sub": iss,
@@ -151,6 +180,38 @@ def rogue_assertion_as(iss: str, scope: str | None = None, **kw) -> str:
     if scope is not None:
         payload["scope"] = scope
     return sign_compact(ROGUE_KEY, header, payload)
+
+
+def forge_issuer_token(
+    *,
+    sub: str,
+    scope: str,
+    aud: str = "internal-admin",
+    kid: str = "ts-v1",
+    typ: str = TYP_ACCESS_TOKEN,
+    act: dict | None = None,
+    lifetime: int = 30,
+    jti: str | None = None,
+) -> str:
+    """Sign an access token with the REAL issuer seed. Used to prove that
+    the consumer-side policy catches token shapes the issuer should never
+    produce - compromised-issuer simulation.
+    """
+    now = int(time.time())
+    header = {"alg": "EdDSA", "typ": typ, "kid": kid}
+    payload = {
+        "iss": "token-service",
+        "sub": sub,
+        "aud": aud,
+        "scope": scope,
+        "iat": now,
+        "nbf": now,
+        "exp": now + lifetime,
+        "jti": jti or str(uuid.uuid4()),
+    }
+    if act is not None:
+        payload["act"] = act
+    return sign_compact(TOKEN_ISSUER_KEY, header, payload)
 
 
 def decode_token_payload(token: str) -> dict:
