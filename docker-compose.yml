@@ -37,6 +37,13 @@ services:
       # Only public verification key material is present here. This service
       # cannot sign a token. Format: kid:b64pub,kid:b64pub,...
       TOKEN_VERIFY_KEYS: "ts-v1:4_8ZaE2hEz2uzxSMv0nhZT44RTGh6ugyXSOLxE8Xfq0"
+      # Each replica has its own response signing key. Operators pin both
+      # public keys and use the kid in the response envelope to decide
+      # which one to verify against. This binds the response to a
+      # specific replica and prevents a malicious gateway from lying
+      # about which replica answered.
+      RESPONSE_SIGNING_KEY_ID: ia-a-v1
+      RESPONSE_SIGNING_KEY_SEED_B64: "aWEtYS1yZXNwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
     expose:
       - "5001"
     networks:
@@ -51,6 +58,8 @@ services:
       TOKEN_AUDIENCE: internal-admin
       REDIS_URL: redis://redis:6379/0
       TOKEN_VERIFY_KEYS: "ts-v1:4_8ZaE2hEz2uzxSMv0nhZT44RTGh6ugyXSOLxE8Xfq0"
+      RESPONSE_SIGNING_KEY_ID: ia-b-v1
+      RESPONSE_SIGNING_KEY_SEED_B64: "aWEtYi1yZXNwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
     expose:
       - "5001"
     networks:

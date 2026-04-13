@@ -10,10 +10,12 @@ keys wired into docker-compose.yml.
 """
 
 import base64
+import hashlib
 import json
 import time
 import uuid
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -27,6 +29,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 TYP_ACCESS_TOKEN = "at+jwt"
 TYP_CLIENT_AUTH = "client-auth+jwt"
 TYP_ACTOR_AUTH = "actor-auth+jwt"
+TYP_RESPONSE_ENVELOPE = "ar+jwt"
 
 
 def b64d(s: str) -> bytes:
@@ -217,3 +220,135 @@ def forge_issuer_token(
 def decode_token_payload(token: str) -> dict:
     _h, p, _s = token.split(".", 2)
     return json.loads(b64d(p).decode())
+
+
+# -----------------------------------------------------------------------------
+# Response envelope verification (operator-side)
+# -----------------------------------------------------------------------------
+
+
+# Operator-side pinned public keys for response signing. These are the
+# *PUBLIC* halves of the per-replica response signing keys held in
+# docker-compose.yml. The operator never holds the private halves; only
+# the replicas do.
+RESPONSE_VERIFY_KEYS = {
+    "ia-a-v1": Ed25519PublicKey.from_public_bytes(
+        b64d("1J4Sact6I6dwrXK7OBx36kwhIUfyKZg8aq4vvm8aA0c")
+    ),
+    "ia-b-v1": Ed25519PublicKey.from_public_bytes(
+        b64d("IPNc7YQOXQCpP9qnxMfHoPiW2DcwWeDbt5SP2nLvu14")
+    ),
+}
+
+# Map from kid to the replica name we expect to see in iss. This
+# enforces that the kid and iss are not independently mutable -- a
+# malicious gateway cannot claim "this came from replica B" while
+# signing with replica A's key, because the operator pins both.
+RESPONSE_KID_TO_REPLICA = {
+    "ia-a-v1": "internal-admin-a",
+    "ia-b-v1": "internal-admin-b",
+}
+
+
+class EnvelopeVerifyError(Exception):
+    pass
+
+
+def verify_response_envelope(
+    *,
+    envelope_jwt: str,
+    body_bytes: bytes,
+    expected_request_nonce: str,
+    expected_actor_jti: str | None,
+    expected_subject: str | None,
+    expected_scope: str | None,
+    expected_endpoint: str,
+    expected_status: int,
+    expected_replica: str | None = None,
+    max_age_sec: int = 60,
+):
+    """Verify a backend-signed response envelope against the response
+    body the operator received. This is the operator-side defense
+    against a malicious relay (gateway). Any failure raises
+    EnvelopeVerifyError with a specific reason -- the operator MUST
+    treat such failures as untrusted responses.
+
+    Returns the verified claims dict on success.
+    """
+    if not envelope_jwt or envelope_jwt.count(".") != 2:
+        raise EnvelopeVerifyError("missing or malformed envelope")
+    h_b64, p_b64, s_b64 = envelope_jwt.split(".", 2)
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    try:
+        header = json.loads(b64d(h_b64).decode())
+        claims = json.loads(b64d(p_b64).decode())
+        sig = b64d(s_b64)
+    except Exception:
+        raise EnvelopeVerifyError("envelope encoding")
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        raise EnvelopeVerifyError("envelope structure")
+    if header.get("alg") != "EdDSA":
+        raise EnvelopeVerifyError("envelope alg")
+    if header.get("typ") != TYP_RESPONSE_ENVELOPE:
+        raise EnvelopeVerifyError("envelope typ")
+    kid = header.get("kid")
+    pub = RESPONSE_VERIFY_KEYS.get(kid)
+    if pub is None:
+        raise EnvelopeVerifyError("unknown response kid")
+    try:
+        pub.verify(sig, signing_input)
+    except InvalidSignature:
+        raise EnvelopeVerifyError("envelope signature")
+
+    # Pin iss to whatever the kid says. A signature from kid=ia-a-v1
+    # MUST claim iss=internal-admin-a. This blocks "swap kid headers
+    # between replicas" attacks before any other claim check.
+    expected_iss_from_kid = RESPONSE_KID_TO_REPLICA.get(kid)
+    if claims.get("iss") != expected_iss_from_kid:
+        raise EnvelopeVerifyError("iss/kid mismatch")
+    if expected_replica is not None and claims.get("iss") != expected_replica:
+        raise EnvelopeVerifyError("replica mismatch")
+
+    # Time bounds.
+    now = int(time.time())
+    iat = claims.get("iat")
+    exp = claims.get("exp")
+    if not isinstance(iat, int) or not isinstance(exp, int):
+        raise EnvelopeVerifyError("envelope time claims")
+    if iat > now + 5:
+        raise EnvelopeVerifyError("envelope from the future")
+    if exp <= now - 5:
+        raise EnvelopeVerifyError("envelope expired")
+    if iat < now - max_age_sec:
+        raise EnvelopeVerifyError("envelope stale")
+
+    # Endpoint and status.
+    if claims.get("endpoint") != expected_endpoint:
+        raise EnvelopeVerifyError("endpoint mismatch")
+    if claims.get("status") != expected_status:
+        raise EnvelopeVerifyError("status mismatch")
+
+    # Caller binding: the operator MUST pass the nonce they sent so a
+    # captured envelope cannot be replayed onto a different request.
+    if claims.get("request_nonce") != expected_request_nonce:
+        raise EnvelopeVerifyError("nonce mismatch")
+
+    # Actor / subject binding -- only checked for delegated calls.
+    if expected_actor_jti is not None:
+        if claims.get("actor_jti") != expected_actor_jti:
+            raise EnvelopeVerifyError("actor_jti mismatch")
+    if expected_subject is not None:
+        if claims.get("subject") != expected_subject:
+            raise EnvelopeVerifyError("subject mismatch")
+    if expected_scope is not None:
+        if claims.get("scope") != expected_scope:
+            raise EnvelopeVerifyError("scope mismatch")
+
+    # Body integrity: the operator recomputes the SHA-256 of the actual
+    # bytes they received. The relay cannot mutate the body without
+    # invalidating the envelope.
+    expected_hash = b64e(hashlib.sha256(body_bytes).digest())
+    if claims.get("body_sha256") != expected_hash:
+        raise EnvelopeVerifyError("body hash mismatch")
+
+    return claims

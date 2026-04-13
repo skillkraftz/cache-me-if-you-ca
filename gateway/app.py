@@ -338,17 +338,27 @@ def export():
         if isinstance(body, str):
             return (body, status, {"Content-Type": "application/json"})
         return body, status
+    # Forward the operator's request nonce verbatim to internal-admin so
+    # the response envelope binds to it. The gateway is intentionally a
+    # transparent transport for nonce + envelope: it cannot meaningfully
+    # tamper with either without being detected by the operator.
+    upstream_headers = {"Authorization": f"Bearer {token}"}
+    nonce = request.headers.get("X-Request-Nonce")
+    if nonce is not None:
+        upstream_headers["X-Request-Nonce"] = nonce
     r = requests.get(
         f"{base}/admin/export",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=upstream_headers,
         timeout=REQUEST_TIMEOUT,
         allow_redirects=False,
     )
-    return (
-        r.text,
-        r.status_code,
-        {"Content-Type": r.headers.get("Content-Type", "application/json")},
-    )
+    response_headers = {
+        "Content-Type": r.headers.get("Content-Type", "application/json"),
+    }
+    envelope = r.headers.get("X-Response-Envelope")
+    if envelope is not None:
+        response_headers["X-Response-Envelope"] = envelope
+    return (r.text, r.status_code, response_headers)
 
 
 if __name__ == "__main__":

@@ -429,6 +429,11 @@ def mint():
     }
     if actor_id is not None:
         payload["act"] = {"sub": client_id}
+        # Bind this token to the originating actor assertion's jti so the
+        # downstream service can include it in the response envelope.
+        # This lets the operator verify "the response I am holding came
+        # from a token minted from MY actor assertion" end-to-end.
+        payload["act_jti"] = actor_payload["jti"]
 
     token = _sign_compact(SIGNING_KEY, header, payload)
     return jsonify(

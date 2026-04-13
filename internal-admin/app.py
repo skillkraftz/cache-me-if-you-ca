@@ -1,11 +1,15 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 import os
 import time
 import base64
 import json
+import hashlib
 
 import redis
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.exceptions import InvalidSignature
 
 app = Flask(__name__)
@@ -15,12 +19,23 @@ TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
 JTI_CACHE_TTL_SECONDS = int(os.getenv("JTI_CACHE_TTL_SECONDS", "120"))
 MAX_TOKEN_LIFETIME_SECONDS = int(os.getenv("MAX_TOKEN_LIFETIME_SECONDS", "60"))
 CLOCK_SKEW_SECONDS = int(os.getenv("CLOCK_SKEW_SECONDS", "5"))
+RESPONSE_ENVELOPE_LIFETIME_SECONDS = int(
+    os.getenv("RESPONSE_ENVELOPE_LIFETIME_SECONDS", "60")
+)
+MAX_REQUEST_NONCE_LENGTH = int(os.getenv("MAX_REQUEST_NONCE_LENGTH", "128"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+RESPONSE_SIGNING_KEY_ID = os.environ["RESPONSE_SIGNING_KEY_ID"]
+RESPONSE_SIGNING_KEY = Ed25519PrivateKey.from_private_bytes(
+    base64.urlsafe_b64decode(
+        os.environ["RESPONSE_SIGNING_KEY_SEED_B64"]
+        + "=" * (-len(os.environ["RESPONSE_SIGNING_KEY_SEED_B64"]) % 4)
+    )
+)
 
 # Signing public keys indexed by kid. This service holds NO private key
-# material and can never mint a token. Keys are provided via env for the
-# lab; in production they would be fetched from the issuer's JWKS endpoint
-# and pinned by fingerprint.
+# material for access tokens and can never mint one. Keys are provided via
+# env for the lab; in production they would be fetched from the issuer's
+# JWKS endpoint and pinned by fingerprint.
 TOKEN_VERIFY_KEYS = {}
 for entry in os.getenv("TOKEN_VERIFY_KEYS", "").split(","):
     entry = entry.strip()
@@ -38,28 +53,11 @@ if not TOKEN_VERIFY_KEYS:
 # valid token looks like. It does NOT defer to the issuer's entitlement
 # map. If the issuer is ever compromised or regresses, this is the last
 # line of defense.
-#
-# The split between OPERATOR_SUBJECTS and CLIENT_SUBJECTS encodes the
-# shape rule: delegated tokens minted through an operator carry
-# sub=<operator> and act={sub: <relaying client>}; self-minted tokens
-# (observer) carry sub=<client> and no act claim. Anything outside those
-# two shapes is rejected, regardless of signature.
-#
-# Critically, "gateway" is NOT a legitimate subject in the new trust
-# model. The gateway has no self-mint scopes and is only ever a relay in
-# act.sub. The gateway being present in the subject set previously meant
-# that any issuer regression minting a sub=gateway token would reopen
-# privilege escalation; we cut that at the consumer instead.
 CLIENT_SUBJECTS = {"observer"}
 OPERATOR_SUBJECTS = {"ops-alice", "ops-bob"}
 ALLOWED_SUBJECTS = CLIENT_SUBJECTS | OPERATOR_SUBJECTS
 ALLOWED_ACTORS = {"gateway"}
 
-# Per-subject scope allowlist. This is the consumer's pinned view of
-# which scopes a subject may ever hold. Even if the issuer mints a
-# token with an unexpected (subject, scope) pair - via compromise or bug
-# - the consumer refuses it here. This duplicates the token-service
-# policy deliberately.
 SUBJECT_SCOPE_POLICY = {
     "observer": {"internal.metrics.read", "debug.config.read", "token.discovery"},
     "ops-alice": {"admin.export.read", "internal.metrics.read", "debug.config.read"},
@@ -67,6 +65,7 @@ SUBJECT_SCOPE_POLICY = {
 }
 
 TYP_ACCESS_TOKEN = "at+jwt"
+TYP_RESPONSE_ENVELOPE = "ar+jwt"  # "admin response"
 
 
 # -----------------------------------------------------------------------------
@@ -76,6 +75,18 @@ TYP_ACCESS_TOKEN = "at+jwt"
 
 def _b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _b64e(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _sign_compact(priv: Ed25519PrivateKey, header: dict, payload: dict) -> str:
+    h_b64 = _b64e(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    p_b64 = _b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    sig = priv.sign(signing_input)
+    return f"{h_b64}.{p_b64}.{_b64e(sig)}"
 
 
 def _verify_compact(pub_by_kid, token: str, expected_typ: str):
@@ -175,10 +186,6 @@ def verify_token(token: str):
     if subject not in ALLOWED_SUBJECTS:
         return None, "subject not permitted"
 
-    # (sub, act) coherence. Operators must always carry an act claim
-    # naming a registered relaying client; clients (observer) must
-    # never carry one. A token whose shape contradicts its subject kind
-    # is suspicious regardless of signature validity.
     act = payload.get("act")
     if subject in OPERATOR_SUBJECTS:
         if not isinstance(act, dict):
@@ -190,9 +197,6 @@ def verify_token(token: str):
         if act is not None:
             return None, "self-minted token must not carry act claim"
 
-    # Consumer-side subject/scope policy. This duplicates the issuer's
-    # entitlement map on purpose: it catches the case where the issuer
-    # is compromised or regressed into minting out-of-policy tokens.
     scope_claim = payload.get("scope", "")
     if not isinstance(scope_claim, str) or not scope_claim:
         return None, "missing scope"
@@ -218,17 +222,146 @@ def verify_token(token: str):
 def require_scope(scope: str):
     auth = request.headers.get("Authorization", "") or ""
     if not auth.startswith("Bearer "):
-        return None, (jsonify({"error": "forbidden"}), 403)
+        return None, _envelope_error("forbidden", 403)
     token = auth.split(None, 1)[1].strip()
     payload, err = verify_token(token)
     if err:
         if err == "replay store unavailable":
-            return None, (jsonify({"error": err}), 503)
-        return None, (jsonify({"error": err}), 403)
+            return None, _envelope_error(err, 503)
+        return None, _envelope_error(err, 403)
     scopes = set((payload.get("scope") or "").split())
     if scope not in scopes:
-        return None, (jsonify({"error": "missing required scope"}), 403)
+        return None, _envelope_error("missing required scope", 403)
     return payload, None
+
+
+# -----------------------------------------------------------------------------
+# Response envelope construction
+#
+# Every response from a scoped endpoint - success or error - carries a
+# signed envelope in the X-Response-Envelope header. The envelope is a
+# compact Ed25519 JWT-shape that binds:
+#
+#   - This replica's identity (iss) and signing kid
+#   - The HTTP path and status code (so a malicious gateway cannot
+#     swap a 200 from a different endpoint into this slot)
+#   - The caller-supplied X-Request-Nonce (so the same envelope cannot
+#     be replayed against a different request)
+#   - The actor-assertion JTI of the operator who authorized the call
+#     (extracted from the access token's act_jti claim, so the operator
+#     can verify "this response came from a token minted from MY actor
+#     assertion")
+#   - The token subject and scope
+#   - A SHA-256 of the canonical JSON body bytes
+#
+# The body itself is serialized once with a fixed canonicalization
+# (sort_keys + tight separators) so the operator can recompute the same
+# digest. The envelope is a header, not part of the body, so the body
+# bytes themselves are exactly what the operator hashes.
+# -----------------------------------------------------------------------------
+
+
+def _canonical_body(payload: dict) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _build_envelope(
+    *,
+    body_bytes: bytes,
+    status: int,
+    endpoint: str,
+    subject: str,
+    scope: str,
+    actor_jti: str,
+    request_nonce: str,
+) -> str:
+    now = int(time.time())
+    body_hash = hashlib.sha256(body_bytes).digest()
+    header = {
+        "alg": "EdDSA",
+        "typ": TYP_RESPONSE_ENVELOPE,
+        "kid": RESPONSE_SIGNING_KEY_ID,
+    }
+    claims = {
+        "iss": REPLICA_NAME,
+        "iat": now,
+        "exp": now + RESPONSE_ENVELOPE_LIFETIME_SECONDS,
+        "endpoint": endpoint,
+        "status": status,
+        "request_nonce": request_nonce,
+        "actor_jti": actor_jti,
+        "subject": subject,
+        "scope": scope,
+        "body_sha256": _b64e(body_hash),
+    }
+    return _sign_compact(RESPONSE_SIGNING_KEY, header, claims)
+
+
+def _request_nonce() -> str:
+    nonce = request.headers.get("X-Request-Nonce", "") or ""
+    # An attacker cannot meaningfully control the nonce field beyond
+    # forcing missing / oversize, both of which the operator detects on
+    # verify. We still bound size to avoid memory abuse.
+    if len(nonce) > MAX_REQUEST_NONCE_LENGTH:
+        return ""
+    return nonce
+
+
+def _envelope_response(
+    payload: dict,
+    status: int,
+    *,
+    subject: str,
+    scope: str,
+    actor_jti: str,
+):
+    body_bytes = _canonical_body(payload)
+    envelope = _build_envelope(
+        body_bytes=body_bytes,
+        status=status,
+        endpoint=request.path,
+        subject=subject,
+        scope=scope,
+        actor_jti=actor_jti,
+        request_nonce=_request_nonce(),
+    )
+    resp = Response(body_bytes, status=status, mimetype="application/json")
+    resp.headers["X-Response-Envelope"] = envelope
+    return resp
+
+
+def _envelope_error(message: str, status: int):
+    """Sign an error response so an operator can distinguish 'internal-
+    admin really refused this' from 'gateway lied'. Subject and scope
+    are blank because we may not have parsed a valid token yet.
+    """
+    payload = {"error": message}
+    body_bytes = _canonical_body(payload)
+    envelope = _build_envelope(
+        body_bytes=body_bytes,
+        status=status,
+        endpoint=request.path,
+        subject="",
+        scope="",
+        actor_jti="",
+        request_nonce=_request_nonce(),
+    )
+    resp = Response(body_bytes, status=status, mimetype="application/json")
+    resp.headers["X-Response-Envelope"] = envelope
+    return resp
+
+
+def _envelope_metadata(payload):
+    """Pull (subject, scope, actor_jti) out of the verified token payload
+    for inclusion in the response envelope. The act_jti claim is a token-
+    service addition that lets us tie the envelope to the operator's
+    original actor assertion.
+    """
+    return (
+        payload.get("sub", ""),
+        payload.get("scope", ""),
+        payload.get("act_jti", ""),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -246,15 +379,17 @@ def debug_config():
     payload, err = require_scope("debug.config.read")
     if err:
         return err
-    return jsonify(
-        {
-            "service": REPLICA_NAME,
-            "app_env": os.getenv("APP_ENV", "dev"),
-            "token_audience": TOKEN_AUDIENCE,
-            "replica": REPLICA_NAME,
-            "caller": payload.get("sub"),
-            "actor": (payload.get("act") or {}).get("sub"),
-        }
+    subject, scope, actor_jti = _envelope_metadata(payload)
+    body = {
+        "service": REPLICA_NAME,
+        "app_env": os.getenv("APP_ENV", "dev"),
+        "token_audience": TOKEN_AUDIENCE,
+        "replica": REPLICA_NAME,
+        "caller": payload.get("sub"),
+        "actor": (payload.get("act") or {}).get("sub"),
+    }
+    return _envelope_response(
+        body, 200, subject=subject, scope=scope, actor_jti=actor_jti
     )
 
 
@@ -263,14 +398,16 @@ def metrics():
     payload, err = require_scope("internal.metrics.read")
     if err:
         return err
-    return jsonify(
-        {
-            "service": REPLICA_NAME,
-            "caller": payload.get("sub"),
-            "actor": (payload.get("act") or {}).get("sub"),
-            "status": "ok",
-            "queue_depth": 2,
-        }
+    subject, scope, actor_jti = _envelope_metadata(payload)
+    body = {
+        "service": REPLICA_NAME,
+        "caller": payload.get("sub"),
+        "actor": (payload.get("act") or {}).get("sub"),
+        "status": "ok",
+        "queue_depth": 2,
+    }
+    return _envelope_response(
+        body, 200, subject=subject, scope=scope, actor_jti=actor_jti
     )
 
 
@@ -279,17 +416,19 @@ def export():
     payload, err = require_scope("admin.export.read")
     if err:
         return err
-    return jsonify(
-        {
-            "service": REPLICA_NAME,
-            "caller": payload.get("sub"),
-            "actor": (payload.get("act") or {}).get("sub"),
-            "records": 2,
-            "users": [
-                {"id": 1, "email": "alice@example.internal"},
-                {"id": 2, "email": "bob@example.internal"},
-            ],
-        }
+    subject, scope, actor_jti = _envelope_metadata(payload)
+    body = {
+        "service": REPLICA_NAME,
+        "caller": payload.get("sub"),
+        "actor": (payload.get("act") or {}).get("sub"),
+        "records": 2,
+        "users": [
+            {"id": 1, "email": "alice@example.internal"},
+            {"id": 2, "email": "bob@example.internal"},
+        ],
+    }
+    return _envelope_response(
+        body, 200, subject=subject, scope=scope, actor_jti=actor_jti
     )
 
 
