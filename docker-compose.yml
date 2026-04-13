@@ -1,0 +1,90 @@
+services:
+  gateway:
+    build: ./gateway
+    ports:
+      - "18080:5000"
+    environment:
+      APP_ENV: dev
+      REQUEST_TIMEOUT: "3"
+      ADMIN_API_KEY: lab-admin-key
+      TOKEN_SERVICE_URL: http://token-service:5003
+      INTERNAL_ADMIN_A_URL: http://internal-admin-a:5001
+      INTERNAL_ADMIN_B_URL: http://internal-admin-b:5001
+      ALLOWED_PROXY_URLS: http://internal-admin-a:5001/health,http://internal-admin-b:5001/health
+      GATEWAY_CLIENT_ID: gateway
+      GATEWAY_CLIENT_SECRET: gateway-client-secret
+    depends_on:
+      - token-service
+      - internal-admin-a
+      - internal-admin-b
+      - redirector
+      - redis
+    networks:
+      - ring
+
+  internal-admin-a:
+    build: ./internal-admin
+    environment:
+      APP_ENV: dev
+      REPLICA_NAME: internal-admin-a
+      ACCESS_TOKEN_SECRET: lab-access-token-secret
+      JTI_CACHE_TTL_SECONDS: "120"
+      TOKEN_AUDIENCE: internal-admin
+      REDIS_URL: redis://redis:6379/0
+    expose:
+      - "5001"
+    networks:
+      - ring
+
+  internal-admin-b:
+    build: ./internal-admin
+    environment:
+      APP_ENV: dev
+      REPLICA_NAME: internal-admin-b
+      ACCESS_TOKEN_SECRET: lab-access-token-secret
+      JTI_CACHE_TTL_SECONDS: "120"
+      TOKEN_AUDIENCE: internal-admin
+      REDIS_URL: redis://redis:6379/0
+    expose:
+      - "5001"
+    networks:
+      - ring
+
+  token-service:
+    build: ./token-service
+    environment:
+      APP_ENV: dev
+      REDIS_URL: redis://redis:6379/0
+      STRICT_REDIS: "false"
+      TOKEN_AUDIENCE: internal-admin
+      ACCESS_TOKEN_SECRET: lab-access-token-secret
+      NONCE_TTL_SECONDS: "60"
+      RATE_LIMIT_PER_MINUTE: "120"
+      RATE_LIMIT_BURST: "60"
+      GATEWAY_CLIENT_SECRET: gateway-client-secret
+      OBSERVER_CLIENT_SECRET: observer-client-secret
+    expose:
+      - "5003"
+    depends_on:
+      - redis
+    networks:
+      - ring
+
+  redirector:
+    build: ./redirector
+    expose:
+      - "5002"
+    networks:
+      - ring
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    networks:
+      - ring
+
+networks:
+  ring:
+    driver: bridge
