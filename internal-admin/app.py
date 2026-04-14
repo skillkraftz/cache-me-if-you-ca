@@ -3,13 +3,22 @@ import os
 
 import redis
 
-from shared.auth import now_ts, verify_payload
+from shared.auth import (
+    canonical_json_bytes,
+    new_jti,
+    now_ts,
+    sha256_hex,
+    sign_payload,
+    verify_payload,
+)
 
 app = Flask(__name__)
 REPLICA_NAME = os.getenv("REPLICA_NAME", "internal-admin")
 REPLICA_TARGET = os.getenv("REPLICA_TARGET", "a")
 TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
 ACCESS_TOKEN_PUBLIC_KEY_PEM = os.getenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", "")
+RESPONSE_SIGNING_PRIVATE_KEY_PEM = os.getenv("RESPONSE_SIGNING_PRIVATE_KEY_PEM", "")
+RESPONSE_PROOF_AUDIENCE = os.getenv("RESPONSE_PROOF_AUDIENCE", "gateway")
 OPERATOR_PUBLIC_KEY_PEM = os.getenv("OPERATOR_PUBLIC_KEY_PEM", "")
 OPERATOR_ASSERTION_AUDIENCE = os.getenv(
     "OPERATOR_ASSERTION_AUDIENCE", "mesh-operator-approval"
@@ -158,6 +167,27 @@ def require_scope(scope: str):
     return payload, None
 
 
+def _response_proof(body: dict, payload: dict, path: str) -> str:
+    now = now_ts()
+    return sign_payload(
+        {
+            "iss": REPLICA_NAME,
+            "sub": REPLICA_NAME,
+            "aud": RESPONSE_PROOF_AUDIENCE,
+            "path": path,
+            "target_replica": REPLICA_TARGET,
+            "client_id": payload.get("client_id"),
+            "actor": payload.get("actor"),
+            "token_jti": payload.get("jti"),
+            "body_sha256": sha256_hex(canonical_json_bytes(body)),
+            "iat": now,
+            "exp": now + 60,
+            "jti": new_jti(),
+        },
+        RESPONSE_SIGNING_PRIVATE_KEY_PEM,
+    )
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": REPLICA_NAME})
@@ -201,17 +231,19 @@ def export():
     payload, err = require_scope("admin.export.read")
     if err:
         return err
-    return jsonify(
-        {
-            "service": REPLICA_NAME,
-            "caller": payload.get("client_id"),
-            "records": 2,
-            "users": [
-                {"id": 1, "email": "alice@example.internal"},
-                {"id": 2, "email": "bob@example.internal"},
-            ],
-        }
-    )
+    body = {
+        "service": REPLICA_NAME,
+        "caller": payload.get("client_id"),
+        "actor": payload.get("actor"),
+        "target_replica": REPLICA_TARGET,
+        "records": 2,
+        "users": [
+            {"id": 1, "email": "alice@example.internal"},
+            {"id": 2, "email": "bob@example.internal"},
+        ],
+    }
+    body["response_proof"] = _response_proof(body, payload, "/admin/export")
+    return jsonify(body)
 
 
 if __name__ == "__main__":

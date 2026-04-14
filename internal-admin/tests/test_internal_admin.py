@@ -94,8 +94,11 @@ def _access_token(
 def module_and_client(monkeypatch):
     token_private, token_public = _keypair()
     operator_private, operator_public = _keypair()
+    response_private, response_public = _keypair()
     wrong_private, _ = _keypair()
     monkeypatch.setenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", token_public)
+    monkeypatch.setenv("RESPONSE_SIGNING_PRIVATE_KEY_PEM", response_private)
+    monkeypatch.setenv("RESPONSE_PROOF_AUDIENCE", "gateway")
     monkeypatch.setenv("OPERATOR_PUBLIC_KEY_PEM", operator_public)
     monkeypatch.setenv("TOKEN_AUDIENCE", "internal-admin")
     monkeypatch.setenv("REPLICA_TARGET", "a")
@@ -111,6 +114,7 @@ def module_and_client(monkeypatch):
     keys = {
         "token_private": token_private,
         "operator_private": operator_private,
+        "response_public": response_public,
         "wrong_private": wrong_private,
     }
     with module.app.test_client() as client:

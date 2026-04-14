@@ -2,7 +2,14 @@ import os
 
 import requests
 
-from shared.auth import canonical_json_bytes, new_jti, now_ts, sha256_hex, sign_payload
+from shared.auth import (
+    canonical_json_bytes,
+    new_jti,
+    now_ts,
+    sha256_hex,
+    sign_payload,
+    verify_payload,
+)
 
 GATEWAY_BASE = "http://gateway:5000"
 TOKEN_SERVICE_BASE = "http://token-service:5003"
@@ -15,9 +22,43 @@ SERVICE_ASSERTION_AUDIENCE = os.getenv("SERVICE_ASSERTION_AUDIENCE", "token-serv
 OPERATOR_ASSERTION_AUDIENCE = os.getenv(
     "OPERATOR_ASSERTION_AUDIENCE", "mesh-operator-approval"
 )
+RESPONSE_PROOF_AUDIENCE = os.getenv("RESPONSE_PROOF_AUDIENCE", "gateway")
+ADMIN_A_RESPONSE_PUBLIC_KEY_PEM = os.environ["INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM"]
+ADMIN_B_RESPONSE_PUBLIC_KEY_PEM = os.environ["INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM"]
 
 
-def _operator_assertion(client_id: str = "gateway", target: str = "a"):
+def _gateway_query_hash(params: dict[str, str]) -> str:
+    return sha256_hex(
+        canonical_json_bytes({key: [value] for key, value in sorted(params.items())})
+    )
+
+
+def _operator_assertion(
+    path: str, params: dict[str, str], target: str, client_id: str = "gateway"
+):
+    now = now_ts()
+    return sign_payload(
+        {
+            "iss": "ops-admin",
+            "sub": "ops-admin",
+            "aud": OPERATOR_ASSERTION_AUDIENCE,
+            "scope": "admin.export.read",
+            "client_id": client_id,
+            "resource": "/admin/export",
+            "target": target,
+            "method": "GET",
+            "path": path,
+            "query_sha256": _gateway_query_hash(params),
+            "body_sha256": sha256_hex(b""),
+            "iat": now,
+            "exp": now + 30,
+            "jti": new_jti(),
+        },
+        OPERATOR_PRIVATE_KEY_PEM,
+    )
+
+
+def _mint_operator_assertion(client_id: str = "gateway", target: str = "a"):
     now = now_ts()
     return sign_payload(
         {
@@ -83,15 +124,31 @@ def _mint(
     )
 
 
+def _verify_response_proof(body: dict, public_key_pem: str, expected_target: str):
+    proof = body["response_proof"]
+    payload = verify_payload(proof, public_key_pem)
+    assert payload is not None
+    assert payload["aud"] == RESPONSE_PROOF_AUDIENCE
+    assert payload["path"] == "/admin/export"
+    assert payload["target_replica"] == expected_target
+    unsigned = dict(body)
+    unsigned.pop("response_proof", None)
+    assert payload["body_sha256"] == sha256_hex(canonical_json_bytes(unsigned))
+
+
 def test_ops_export_still_works_with_operator_assertion():
+    params = {"target": "a"}
     r = requests.get(
         f"{GATEWAY_BASE}/ops/export",
-        params={"target": "a"},
-        headers={"X-Operator-Assertion": _operator_assertion(target="a")},
+        params=params,
+        headers={
+            "X-Operator-Assertion": _operator_assertion("/ops/export", params, "a")
+        },
         timeout=5,
     )
     assert r.status_code == 200
     assert r.json()["service"] == "internal-admin-a"
+    _verify_response_proof(r.json(), ADMIN_A_RESPONSE_PUBLIC_KEY_PEM, "a")
 
 
 def test_compromised_gateway_cannot_mint_export_without_operator_approval():
@@ -126,7 +183,7 @@ def test_gateway_cannot_query_token_discovery_with_service_identity_alone():
 
 
 def test_operator_approval_is_single_use_for_token_minting():
-    approval = _operator_assertion(target="a")
+    approval = _mint_operator_assertion(target="a")
     first = _mint(
         "admin.export.read",
         "gateway",
@@ -147,7 +204,7 @@ def test_operator_approval_is_single_use_for_token_minting():
 
 
 def test_same_export_token_cannot_be_replayed_across_replicas():
-    approval = _operator_assertion(target="a")
+    approval = _mint_operator_assertion(target="a")
     mint = _mint(
         "admin.export.read",
         "gateway",
@@ -174,10 +231,15 @@ def test_same_export_token_cannot_be_replayed_across_replicas():
 
 
 def test_operator_approval_cannot_be_redirected_to_other_replica():
+    params = {"target": "b"}
     r = requests.get(
         f"{GATEWAY_BASE}/ops/export",
-        params={"target": "b"},
-        headers={"X-Operator-Assertion": _operator_assertion(target="a")},
+        params=params,
+        headers={
+            "X-Operator-Assertion": _operator_assertion(
+                "/ops/export", {"target": "a"}, "a"
+            )
+        },
         timeout=5,
     )
     assert r.status_code == 403
@@ -185,7 +247,7 @@ def test_operator_approval_cannot_be_redirected_to_other_replica():
 
 
 def test_export_token_is_bound_to_target_replica():
-    approval = _operator_assertion(target="a")
+    approval = _mint_operator_assertion(target="a")
     mint = _mint(
         "admin.export.read",
         "gateway",
@@ -203,6 +265,43 @@ def test_export_token_is_bound_to_target_replica():
     )
     assert r.status_code == 403
     assert r.json()["error"] == "wrong target replica"
+
+
+def test_operator_proof_is_single_use_at_gateway():
+    params = {"target": "a"}
+    proof = _operator_assertion("/ops/export", params, "a")
+
+    first = requests.get(
+        f"{GATEWAY_BASE}/ops/export",
+        params=params,
+        headers={"X-Operator-Assertion": proof},
+        timeout=5,
+    )
+    second = requests.get(
+        f"{GATEWAY_BASE}/ops/export",
+        params=params,
+        headers={"X-Operator-Assertion": proof},
+        timeout=5,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 403
+    assert second.json()["error"] == "operator proof replay"
+
+
+def test_operator_proof_cannot_be_rebound_to_use_token_request():
+    export_params = {"target": "a"}
+    proof = _operator_assertion("/ops/export", export_params, "a")
+
+    r = requests.get(
+        f"{GATEWAY_BASE}/ops/use-token",
+        params={"target": "a", "token": "placeholder"},
+        headers={"X-Operator-Assertion": proof},
+        timeout=5,
+    )
+
+    assert r.status_code == 403
+    assert r.json()["error"] == "operator request mismatch"
 
 
 def test_observer_can_still_read_debug_config():

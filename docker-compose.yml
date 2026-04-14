@@ -162,6 +162,88 @@ x-operator-private-key: &operator_private |-
   EH9uwNhK8f+W42C1dhD7UDw=
   -----END PRIVATE KEY-----
 
+x-admin-a-response-private-key: &admin_a_response_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCzOiJnIfE62txD
+  8V+zMIMdwSqoZxiU+7tfGaZeoPX6JBRpUKqKfaLd9z+zNaxfHcryLsOqiwc612dQ
+  bJ9wEXK/dgbyhOydB+82Z93tl/sgY3HBKPiWelxA9f2/AswXr5toyo0hozKDDNqi
+  vm+fwXBl+wzfi6vNbdZKIExwXk0jP1BJyfOx5QLacQkgWU/6yOiJuMzUAxzo5XuH
+  JphbL9+UkJwX8m874vcNttW0JYMl579uCjFB4uS7UZPxkX6FWDQgrrJrkNpOgAw7
+  dRTE0ETCKonP2O8oO/haaceRVWgmWVWwovS1O6IsG3JdDxthzF82QpYVk7oy4ti6
+  mXlfanxJAgMBAAECggEAAMgU05M5holNtdhOU6fsix4MfLLDZTiXo6A8jPPXKBhi
+  xDv4nGqUbIhKHV197eXBkhlhBiQS+7SUrqGkodlaS9+yGM9lKpZOOp63aunItnEn
+  PeGFplQBsDuqYpF6w0fYozC5RBTpO4VRiZgP66Kihff97BZ4tl2qNi/1HrXTO19m
+  ztOMfoLDuSuOkhsPFqRNVWgC/cRgpE1zkyz7JdDxNgVsNd1B6Looa+tdFvnCaZh+
+  NTgA9J0VIHCoGpoBk3ViufYi21ef3Zv266TksMinw5b0Ozsj0FvJt3qTRyMebmgO
+  nDkqE60CSY8MUssoA7Tx9BN8OVpeE7AGXnKLh9Y3YQKBgQDq0pN4MOL4m3A1BXxc
+  x2ZgCKyFeLpnlUGk+iIyqXAvaTc32WVh44w5Wciek0y7AiRuP79lpQKc4HAFdbvN
+  xCaweNjF6GQOtCY6zBPhUHytW0F1FnC6zdemZLb08NeVA69+BI9flRu3zQE1Ph7b
+  6xlKhR3c/WESJGyUSNWU9CgVaQKBgQDDZAH66MvJSZz/QRPwmEsBGGuVABvj21ad
+  OG4Rc2m+6E8RzTEapVnt95p0Lw2B/WeacXiVic6irfOLV1iSvbgo/DJ/vAj3Iuta
+  IJucUsL+515Jcgxi7xIt0Nw1TklJdvMhW7wgaN2M7ZnECWvPd6GoGYRM2k8CoMCj
+  pLa8oFXz4QKBgFHKVNk5VeU35uZg6cc7INp0SvsWaP7pSvsWsNCqmcu5vyTx0NE+
+  u7nCHxG0xrYgceYAyD60MevIdNxB/M8X8k3nWcHdRvSkJOi36njBWxvavDr3PP6j
+  8eggDmXUeZKKvRaMqg+l1Qi5HCGaaI87HQ0KvrMZgjUagMNJdzMxs8B5AoGBAK/V
+  9jo4+fvhNVo41Jr2UrlfoqFqga7imuXN/K/Tr1xQb6fTgtc56t5Orz7TgVJ0G6JP
+  b3cTl1OrO7swFdOozGyF2WQ+ccsGL8riAWgCytzelml+K0t1XmTAywtlsmpck5x3
+  k6uO86J5yKE04ULJpD9FB1yqMeRpijM6bgD+QZvBAoGBAJm1BiLzfBbO1qkR4VKb
+  v8JF54J9kG6WBP7d8yP247gmqgFLiuehhKVnmNk14/XAGQF1NKa1yShO9H9Ah6r7
+  QA3OWeA5/tIdL5ZoWRNdOsKAkArgQo1lTcEYG43/kYLL4RZ102u9f1FBI58rKZJe
+  jvDz6DvpU2b3KDodMGluzGBG
+  -----END PRIVATE KEY-----
+
+x-admin-a-response-public-key: &admin_a_response_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAszoiZyHxOtrcQ/FfszCD
+  HcEqqGcYlPu7XxmmXqD1+iQUaVCqin2i3fc/szWsXx3K8i7DqosHOtdnUGyfcBFy
+  v3YG8oTsnQfvNmfd7Zf7IGNxwSj4lnpcQPX9vwLMF6+baMqNIaMygwzaor5vn8Fw
+  ZfsM34urzW3WSiBMcF5NIz9QScnzseUC2nEJIFlP+sjoibjM1AMc6OV7hyaYWy/f
+  lJCcF/JvO+L3DbbVtCWDJee/bgoxQeLku1GT8ZF+hVg0IK6ya5DaToAMO3UUxNBE
+  wiqJz9jvKDv4WmnHkVVoJllVsKL0tTuiLBtyXQ8bYcxfNkKWFZO6MuLYupl5X2p8
+  SQIDAQAB
+  -----END PUBLIC KEY-----
+
+x-admin-b-response-private-key: &admin_b_response_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCjWmLi/l0DILIZ
+  lzeQZNA6X5d/26aUaeHCoIFoNqdqzSUtmdXmhKTFvmFtHcOOOd3aLaNB3BidwoDq
+  jVLT2Q2kkbz5SA75MGFuAHO3y9E4UBKeLumTQAKecjbpfIJ54oPiZ3WB2207SNNH
+  yQ2d8oJvYqZXQeWhazl1HcBU54uXkYfOKr6ElHsuJskUxnlJFqe3oY3fBIe00/7q
+  DPtTfOKZk7aC+vpEhhRQAgyh6ibTBH8761DGDmpFWWd9QDVKoryKdqMGwAdvSAtR
+  xd0z47T0AY8t2ZMIQgHpQXrW82GABgZZetkWg1priaXJrNl+zQ/7LAEIa7nAJuPr
+  sEb3KRKfAgMBAAECggEASvJa4WOr4BX9sMEQ9LZUVRvrofVwobJMquPCS8KboGQ7
+  9QaaPZfJE5LsF0irItOI5qO+viZRwvvs8vBhOqJg4IsfJU461Hiuku4xKXghZ1FR
+  oXLLpswdB35GlGyUXoCfWt516tz2aldY3Jwxm7CayKj9wZYR2bQc2g+K4UmU4bZe
+  TJeiJN/VzpybII1FfHLO0x1+/DlXr9ZumYkMec8LuDGOFkno7Z8t8fszpwIVpAfp
+  avS910yGQJWE1gOYyFPdlleJo33dpg0aKp/ow05MAdrldqgy4ZzSOt4fJd7v3g76
+  d2m3l+/XKLQxRMBdaTKKCB9UNA6HlFt3pCYumBfwxQKBgQDkQYTRAmmkNMNngkup
+  Y6s9kFeeL9OeSkcHhZrWf2q1k+i/VpT7VC0HSNzuZ6aoC1WnSdEUR1WiibxeyAek
+  gugyjMwwxm5eAd5YEJaLANduG0GOxBiuRhW8JzBmB8SjHFthsnLHsf6c6PA0wOQ2
+  DU9YhkCQwgAc4ooEpcY43kDQhQKBgQC3NVSKnGuMTJy8uY8ywwrQTt3/C7i1ih6A
+  3uiQQgcacnF5GvQXRFyudnVpVdrsDPOaKEIMi17OEPeWpaDanQJKY+zUTAeh4FO4
+  QS4Q9bnjrx9E9T98gNKk0X7C6gsPWRSzVenxBGsjX88BxnWZ34iYbkNUN/DE1cnB
+  5jCYSLDx0wKBgQCOC3fr2eSEG5G+yIbtUukt1rWv63N1/iNVuv8wnPp7JSCice8k
+  uK2M6vsSIc7EpMkY4gcK55mTHMPs9+5Jom19h8FKWTI1rlP/2dLVjiCClNOnVMFH
+  MrYz8O9dj1f/aZY0pihnvY0FeLCDI8bhHEdUf7eOXixTzWa2nbNNkIIlQQKBgEl5
+  VtVcE/mpQ/agCGDYPb760icV4VbU9JTEUMqB4G1n1kA2Ygvuu6iwEzhSWUDvlMaP
+  PKXhQv0ras/8zry92QxSdMlTUIBIAetUIJBmq803DzhNjs90roWxCsBKsnLOS/H8
+  E504I2uFYfSZTdKPBi3zkob1BFc8UfS0R2rbRDNHAoGAdeaV5hIkI64BkqLup2Kn
+  3+c0xEe2NDz/R1B3S/LOW53xR/AEITzAIJ6gs4f4jwbiqtL0qmh89IpJVuQOSZtZ
+  p84JYExgJoa0KfClCH07BDKEcGVUfH/x+fwsA4zHmuNvHo3k1Ejw/ARAux/nF+xA
+  SaV6npYzbBd6HrAzgqjZQ+s=
+  -----END PRIVATE KEY-----
+
+x-admin-b-response-public-key: &admin_b_response_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo1pi4v5dAyCyGZc3kGTQ
+  Ol+Xf9umlGnhwqCBaDanas0lLZnV5oSkxb5hbR3Djjnd2i2jQdwYncKA6o1S09kN
+  pJG8+UgO+TBhbgBzt8vROFASni7pk0ACnnI26XyCeeKD4md1gdttO0jTR8kNnfKC
+  b2KmV0HloWs5dR3AVOeLl5GHziq+hJR7LibJFMZ5SRant6GN3wSHtNP+6gz7U3zi
+  mZO2gvr6RIYUUAIMoeom0wR/O+tQxg5qRVlnfUA1SqK8inajBsAHb0gLUcXdM+O0
+  9AGPLdmTCEIB6UF61vNhgAYGWXrZFoNaa4mlyazZfs0P+ywBCGu5wCbj67BG9ykS
+  nwIDAQAB
+  -----END PUBLIC KEY-----
+
 services:
   gateway:
     build:
@@ -172,6 +254,7 @@ services:
     environment:
       APP_ENV: dev
       REQUEST_TIMEOUT: "3"
+      REDIS_URL: redis://redis:6379/0
       TOKEN_SERVICE_URL: http://token-service:5003
       INTERNAL_ADMIN_A_URL: http://internal-admin-a:5001
       INTERNAL_ADMIN_B_URL: http://internal-admin-b:5001
@@ -179,9 +262,12 @@ services:
       GATEWAY_CLIENT_ID: gateway
       GATEWAY_CLIENT_PRIVATE_KEY_PEM: *gateway_private
       ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM: *admin_a_response_public
+      INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM: *admin_b_response_public
       TOKEN_AUDIENCE: internal-admin
       SERVICE_ASSERTION_AUDIENCE: token-service
       OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      RESPONSE_PROOF_AUDIENCE: gateway
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
       ALLOWED_OPERATOR_IDS: ops-admin
     depends_on:
@@ -202,6 +288,8 @@ services:
       REPLICA_NAME: internal-admin-a
       REPLICA_TARGET: a
       ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      RESPONSE_SIGNING_PRIVATE_KEY_PEM: *admin_a_response_private
+      RESPONSE_PROOF_AUDIENCE: gateway
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
@@ -222,6 +310,8 @@ services:
       REPLICA_NAME: internal-admin-b
       REPLICA_TARGET: b
       ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      RESPONSE_SIGNING_PRIVATE_KEY_PEM: *admin_b_response_private
+      RESPONSE_PROOF_AUDIENCE: gateway
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
@@ -266,8 +356,11 @@ services:
       GATEWAY_CLIENT_PRIVATE_KEY_PEM: *gateway_private
       OBSERVER_CLIENT_PRIVATE_KEY_PEM: *observer_private
       OPERATOR_PRIVATE_KEY_PEM: *operator_private
+      INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM: *admin_a_response_public
+      INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM: *admin_b_response_public
       SERVICE_ASSERTION_AUDIENCE: token-service
       OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      RESPONSE_PROOF_AUDIENCE: gateway
     depends_on:
       - gateway
       - token-service

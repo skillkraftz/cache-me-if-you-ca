@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request
 import ipaddress
 import os
 import requests
+import redis
 import socket
 from urllib.parse import urljoin, urlparse
 
@@ -16,11 +17,18 @@ from shared.auth import (
 
 app = Flask(__name__)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3"))
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "http://token-service:5003")
 INTERNAL_ADMIN_A_URL = os.getenv("INTERNAL_ADMIN_A_URL", "http://internal-admin-a:5001")
 INTERNAL_ADMIN_B_URL = os.getenv("INTERNAL_ADMIN_B_URL", "http://internal-admin-b:5001")
 TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
 ACCESS_TOKEN_PUBLIC_KEY_PEM = os.getenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", "")
+INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM = os.getenv(
+    "INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM", ""
+)
+INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM = os.getenv(
+    "INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM", ""
+)
 ALLOWED_PROXY_URLS = {
     u.strip() for u in os.getenv("ALLOWED_PROXY_URLS", "").split(",") if u.strip()
 }
@@ -42,6 +50,11 @@ ENABLE_RAW_TOKEN_HELPER = (
 FETCH_MAX_REDIRECTS = int(os.getenv("FETCH_MAX_REDIRECTS", "3"))
 ASSERTION_TTL_SECONDS = int(os.getenv("ASSERTION_TTL_SECONDS", "30"))
 ASSERTION_CLOCK_SKEW_SECONDS = int(os.getenv("ASSERTION_CLOCK_SKEW_SECONDS", "5"))
+RESPONSE_PROOF_AUDIENCE = os.getenv("RESPONSE_PROOF_AUDIENCE", "gateway")
+
+
+def _redis():
+    return redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def _request(method: str, url: str, **kwargs):
@@ -58,12 +71,27 @@ def _admin_target(name: str) -> str | None:
     }.get(name)
 
 
+def _admin_response_public_key(name: str) -> str:
+    if name == "a":
+        return INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM
+    return INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM
+
+
 def _passthrough_response(response):
     return (
         response.text,
         response.status_code,
         {"Content-Type": response.headers.get("Content-Type", "application/json")},
     )
+
+
+def _reserve_once(key: str, ttl: int, error: str, status: int):
+    try:
+        if not _redis().set(key, "1", ex=max(1, ttl), nx=True):
+            return False, jsonify({"error": error}), status
+    except Exception:
+        return False, jsonify({"error": "redis unavailable"}), 503
+    return True, None, None
 
 
 def _resolve_ip_addresses(hostname: str) -> set[str]:
@@ -108,7 +136,19 @@ def _safe_fetch(target: str):
     raise ValueError("too many redirects")
 
 
-def _validate_operator_assertion(
+def _request_query_sha256() -> str:
+    return sha256_hex(
+        canonical_json_bytes(
+            {key: request.args.getlist(key) for key in sorted(request.args.keys())}
+        )
+    )
+
+
+def _request_body_sha256() -> str:
+    return sha256_hex(request.get_data(cache=True) or b"")
+
+
+def _validate_operator_claims(
     operator_assertion: str,
     expected_scope: str,
     expected_resource: str,
@@ -142,13 +182,56 @@ def _validate_operator_assertion(
     return payload, None
 
 
+def _validate_operator_assertion(
+    operator_assertion: str,
+    expected_scope: str,
+    expected_resource: str,
+    expected_target: str,
+):
+    payload, err = _validate_operator_claims(
+        operator_assertion, expected_scope, expected_resource, expected_target
+    )
+    if err:
+        return None, err
+    if payload.get("method") != request.method:
+        return None, "operator request mismatch"
+    if payload.get("path") != request.path:
+        return None, "operator request mismatch"
+    if payload.get("query_sha256") != _request_query_sha256():
+        return None, "operator request mismatch"
+    if payload.get("body_sha256") != _request_body_sha256():
+        return None, "operator request mismatch"
+    return payload, None
+
+
+def _validate_nested_operator_assertion(
+    operator_assertion: str,
+    expected_scope: str,
+    expected_resource: str,
+    expected_target: str,
+):
+    return _validate_operator_claims(
+        operator_assertion, expected_scope, expected_resource, expected_target
+    )
+
+
 def _require_operator(scope: str, resource: str, target: str):
     operator_assertion = request.headers.get("X-Operator-Assertion", "").strip()
     if not operator_assertion:
         return None, (jsonify({"error": "forbidden"}), 403)
-    _, err = _validate_operator_assertion(operator_assertion, scope, resource, target)
+    payload, err = _validate_operator_assertion(
+        operator_assertion, scope, resource, target
+    )
     if err:
         return None, (jsonify({"error": err}), 403)
+    ok, body, status = _reserve_once(
+        f"gateway-operator-proof:{payload['jti']}",
+        payload.get("exp", now_ts()) - now_ts() + ASSERTION_CLOCK_SKEW_SECONDS,
+        "operator proof replay",
+        403,
+    )
+    if not ok:
+        return None, (body, status)
     return operator_assertion, None
 
 
@@ -178,7 +261,7 @@ def _validate_export_token(token: str, expected_target: str):
     operator_assertion = payload.get("operator_assertion", "")
     if not operator_assertion:
         return None, "missing operator approval"
-    operator_payload, err = _validate_operator_assertion(
+    operator_payload, err = _validate_nested_operator_assertion(
         operator_assertion, "admin.export.read", "/admin/export", expected_target
     )
     if err:
@@ -186,6 +269,45 @@ def _validate_export_token(token: str, expected_target: str):
     if payload.get("actor") != operator_payload.get("sub"):
         return None, "actor mismatch"
     return payload, None
+
+
+def _validate_export_response(response, target: str, token_payload: dict):
+    if response.status_code != 200:
+        return None, None
+    try:
+        body = response.json()
+    except ValueError:
+        return None, "bad upstream json"
+    proof = body.get("response_proof", "")
+    if not proof:
+        return None, "missing response proof"
+    proof_payload = verify_payload(proof, _admin_response_public_key(target))
+    if proof_payload is None:
+        return None, "bad response proof"
+    now = now_ts()
+    if proof_payload.get("aud") != RESPONSE_PROOF_AUDIENCE:
+        return None, "bad response proof audience"
+    if proof_payload.get("path") != "/admin/export":
+        return None, "bad response proof path"
+    if proof_payload.get("target_replica") != target:
+        return None, "bad response proof target"
+    if proof_payload.get("client_id") != token_payload.get("client_id"):
+        return None, "bad response proof client"
+    if proof_payload.get("actor") != token_payload.get("actor"):
+        return None, "bad response proof actor"
+    if proof_payload.get("token_jti") != token_payload.get("jti"):
+        return None, "bad response proof token"
+    if proof_payload.get("iat", 0) > now + ASSERTION_CLOCK_SKEW_SECONDS:
+        return None, "response proof not yet valid"
+    if proof_payload.get("exp", 0) < now - ASSERTION_CLOCK_SKEW_SECONDS:
+        return None, "response proof expired"
+    unsigned_body = dict(body)
+    unsigned_body.pop("response_proof", None)
+    if proof_payload.get("body_sha256") != sha256_hex(
+        canonical_json_bytes(unsigned_body)
+    ):
+        return None, "response proof body mismatch"
+    return body, None
 
 
 def _build_service_assertion(method: str, path: str, body_bytes: bytes) -> str:
@@ -310,6 +432,12 @@ def use_token():
         r = _request(
             "GET", f"{base}/admin/export", headers={"Authorization": f"Bearer {token}"}
         )
+        token_payload, _ = _validate_export_token(token, target)
+        body, proof_err = _validate_export_response(r, target, token_payload)
+        if proof_err:
+            return jsonify({"error": proof_err}), 502
+        if body is not None:
+            return jsonify(body)
         return _passthrough_response(r)
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 502
@@ -339,12 +467,17 @@ def export():
         if mint.status_code != 200:
             return _passthrough_response(mint)
         token = mint.json()["access_token"]
-        _, token_err = _validate_export_token(token, target)
+        token_payload, token_err = _validate_export_token(token, target)
         if token_err:
             return jsonify({"error": token_err}), 502
         r = _request(
             "GET", f"{base}/admin/export", headers={"Authorization": f"Bearer {token}"}
         )
+        body, proof_err = _validate_export_response(r, target, token_payload)
+        if proof_err:
+            return jsonify({"error": proof_err}), 502
+        if body is not None:
+            return jsonify(body)
         return _passthrough_response(r)
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 502
