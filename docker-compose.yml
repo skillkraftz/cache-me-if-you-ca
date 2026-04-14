@@ -1,18 +1,187 @@
+x-token-private-key: &token_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDDLekuIwTklLSr
+  GowgVJNXVmNF9HTu7ymI2sQ9yKG4IraOnktIzrgOnRPQ1nEhj+pQl1sQZ9L15qIO
+  8kybdF/ly47f8HH7l/pTKzqknxl8hgf+stn6rzQbdvGy7+58NafUUfgSUJLRUNGI
+  qeRsFO8k+6WOuizm5FbrvbJK0SuyXVlnZXbqI30xvWGMO2m2vO5se0YIelXZvjw+
+  xeKUaJNxE27yDidSP+94ue++4wMSx0kyeHyzZstkRSy3frXrGPBTd0lQLGGcWSU2
+  c+xzmqpKoa30b7djEheHoPcoHuLiqqRnz4ElytAooPJQ77pMPBt2rM6cM5fccs28
+  mZX99GCtAgMBAAECggEALOQm4TMxwWdIhKA3AYqiVvCqJaFbscb1TSJQB4vZUlI9
+  neDfnO/a2pWbRKnF3HvO31lomwXeOiuhM4HcR9cE5YQjqPMTLFRgwXdMZienw4HK
+  XfUB+MwKVpTNc6QGvK/UmZt+zKuWkSkfAGle/dL0zBNLGWBNyo9TRKZdVyL0A3JZ
+  NDA2u/5zAxa8ysVzA0p1aFAJC1Lb0YG9XmOdBGLG6LQAvw+dC6joHF7TMR3s11Ax
+  cMbrB/QozbN68pqhna2Xltrhk82Un3l0goY+kNm+nICOqrNay33RfBbMVIBm21BJ
+  cW/TIGJFRYvT95i8ktYEDmMJ3SXQ9Biswt1t0Y5JCwKBgQDiKKSmKLMbshRNHC6t
+  dcJEj7owN8A514DmvVGRPR9Kj+0T6NkOFvGF0cqTcMtgOm/gs5J0l7kDlqlWGOrx
+  /WxFBPDC/f7kcL7/69LHy8Z0X43DXoCX8GkIAo2gfvlJLsGaYd8pT2S0TrpeWBF4
+  i8H7WZPgIRK43N5mENPYa1JjPwKBgQDc7tJtuLtaq7G+UIHkDxc8HFUu7YHQu13e
+  L7AXsvvAD6kWKJQGlnLjeDtK4YpnCKik6jGjAgFPJ7WovudjWvNxce2Qfa/FLeBo
+  DcYBFQb5i+H5QUebT4/qwr8CMmuOwNc8c6W5qsdT8S7tYf4FgHkxdJYE1iXsBIUL
+  vSkFy489EwKBgCS5WNMqdLsgla9XzjSYlK0xcZh21R4PYn0VbPNaq4QeDu9WtjhV
+  fW6vfGeovz2m/5fLURLhuEde5ax3a19UOYqTnMztFcDelgVUs+uBqX4oLgr1g4go
+  n8WPNJRFShGaKBH7ppM8syucRSMgxeV/PEamax7QAAxIwUxtmxjfhIddAoGBAKJf
+  i5xEVr4OzfVXaf9Y7/SnxhtVR0FHU3fGiJ8CVnATkmvMqu4kiI+Rf9JK7NNI09lQ
+  neZ1xMyOHL7Gf3zQDXdlCfpVxWcfjnwrE0kcUSH6orv0NFJ7KQSa2JMex1oFdKrj
+  O/u2/gQ9kAW7LVyRzYCBdPhdA0XxFG9KOOofb0itAoGAcBQW1vl8ewQoa7YLn/Up
+  NT4qKawNYq3IA/WsjFnlC/UNFr7nOsf6cgSDsIJPbHz8i9xHYW43XSgr/sfhPkG6
+  Ub0suhzh/XtR2r9BZfN9B30PDz9c66Tm7PLxoCG+vdJH3vvRRatNvqVDtP8ejGR3
+  mxQeYoz1P+OlTDkTaAx5LU0=
+  -----END PRIVATE KEY-----
+
+x-token-public-key: &token_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwy3pLiME5JS0qxqMIFST
+  V1ZjRfR07u8piNrEPcihuCK2jp5LSM64Dp0T0NZxIY/qUJdbEGfS9eaiDvJMm3Rf
+  5cuO3/Bx+5f6Uys6pJ8ZfIYH/rLZ+q80G3bxsu/ufDWn1FH4ElCS0VDRiKnkbBTv
+  JPuljros5uRW672yStErsl1ZZ2V26iN9Mb1hjDtptrzubHtGCHpV2b48PsXilGiT
+  cRNu8g4nUj/veLnvvuMDEsdJMnh8s2bLZEUst3616xjwU3dJUCxhnFklNnPsc5qq
+  SqGt9G+3YxIXh6D3KB7i4qqkZ8+BJcrQKKDyUO+6TDwbdqzOnDOX3HLNvJmV/fRg
+  rQIDAQAB
+  -----END PUBLIC KEY-----
+
+x-gateway-private-key: &gateway_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDlyZLfNtXUUOSc
+  BZ+ioA4y7RIIzwf3864b6h1KNtOu0YinDOSVQJ9rSGRCpBe5EsbEGLLKjnoLX3mF
+  N+9FFUPUoADp/bEppbhEyY8T2Zsc8W9YzV2bFZE0WCgQC5/h7qe1UMFFnQCfPkkB
+  g3zq0fmm0BRVRdkG24qMjKi2p5gSiwSUlm7otEkH/XajjNtuC6JtRx8z03vVKVIs
+  +2+mpXSELYHJ1d9KfAoChamfPHKzCGbAL66+xbcCmJX84RjzEafLXudvUsfxptv/
+  ryAztPhpfLYwoRy1nZs1sy9RBsz3RY7P8qZvywo6vvuSUCop+DV15bB5TIntboZH
+  l31gfLmJAgMBAAECggEAaA7GUgrU/la7j+QEDHMKuwkcd5y5cRGKsN1t8iOt7Ka6
+  iVuPT/95se2QaZVBoO/dzwOYQ54NqoTL1QYldlVQ6EKk51GZHtELByt3fXe3hH3Y
+  /I/Tad10ag3Z5po9BuU6USOGwm180KA2E1dmBDieI2prKsp8o1xb+5Xe+QggF5S9
+  Cj2u0CHu3cFH6e5txzv4RiqK5bvc2EddLNfD70o58y9JFzs35rzV94hQfysdwvhr
+  hS5ocaVoOEVDttieLvcxDrn4YEYbQVM0qC2g4r38x4A+E6dqevfajdGRGtRpfBxw
+  L14A7AMpIHQ0VqpL1gOmKpwhdA/T8g6nsgyKjSbzuQKBgQD1AxIPh1zzxVYtTKhM
+  qMUazS9cULLon+Bvn/fUQq5uCRqjkN8AHKEISvg6xKkMSPUCnb59QRuCKYC4/Kak
+  R3mTg2Hu2l7KNLoMJ32hK65SSekSUO1UCMy7Cpjtc1RsF2txgQ4+/5oP+1FgQXgp
+  YtJkG7EM3grXpeDou6Sffu+JkwKBgQDwF7Z/UKKK3VCduZZtN/wyJC7em8jK7iu7
+  7BSyZTSnyl6nKt3u4PDBVHkGGulFjIJDtFvbJRzLVqx87Klx9yDD7EBUdoiwVXqj
+  r2PqBie9+ESqNMaEqj4VergAB5I34SnvqVeKUkI4M9LMlFyqU4fFq674qAd4rTaM
+  KwIyzBgx8wKBgBnoczZ1J90XFt+/ZWSFzCHjZIisd96lWUQ0dC5bxroX+FsnbI1E
+  ebq4wrrkJMQJyu6143i3M8N1xAjLnotsi2yPzgFF0hQrsyip3Fz4k3xcGGs5Z38l
+  VxDINBeXxGuRpmjgLrN2r8HU32wAQEaQDpNLYlNr/1WCUuAJR4UeFRJFAoGBAIMV
+  H0Fxf9z7KhmDCvsEdv/VO3W0bjNFR8FpCn+/u7jkRztTrynNzARxn0XTCYs8RJ68
+  aO5D2+20m6X0/CpJt6zgXtr+gHBtqvCVQKKzy5zvYGXhPIWQASdvAeiaOZ2ipGfB
+  +BaABMF0oeGqGtGvm1A0BOqjqribMU3j6WZcgdU7AoGAJLSXHBuysPBeMM4M5mFQ
+  Td9moy41dd0VKaAjZhFrWcxdqWD4hZvSAdF52npdslh/gTrL8WTWUUYPsE6sCgPV
+  Fgp77bm9lpYE9CRYEZbYcgKGpvLwJV5qIEtBUBsjp9pcRg8Bkuf6je+iRIRLnIMA
+  i8b1BguKaGbJ0iusBvLpWWo=
+  -----END PRIVATE KEY-----
+
+x-gateway-public-key: &gateway_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5cmS3zbV1FDknAWfoqAO
+  Mu0SCM8H9/OuG+odSjbTrtGIpwzklUCfa0hkQqQXuRLGxBiyyo56C195hTfvRRVD
+  1KAA6f2xKaW4RMmPE9mbHPFvWM1dmxWRNFgoEAuf4e6ntVDBRZ0Anz5JAYN86tH5
+  ptAUVUXZBtuKjIyotqeYEosElJZu6LRJB/12o4zbbguibUcfM9N71SlSLPtvpqV0
+  hC2BydXfSnwKAoWpnzxyswhmwC+uvsW3ApiV/OEY8xGny17nb1LH8abb/68gM7T4
+  aXy2MKEctZ2bNbMvUQbM90WOz/Kmb8sKOr77klAqKfg1deWweUyJ7W6GR5d9YHy5
+  iQIDAQAB
+  -----END PUBLIC KEY-----
+
+x-observer-public-key: &observer_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoikDiICThSuVfE1JrN35
+  FaIxkHnAwLke8FWL7ZU828dL2vCBHyVX9bqKDlF2F2OtDXrmjDlGpA6MUv8E2PBD
+  Fhsr+UzJt0qbZv5BGU9gW7Z1Czn4uxO1Dbco8lagbO51VEB3jAaubVrUrvWhkWF+
+  7486kKjkoMjY981jJURPzlISDyc8CIPwwuG4EfQih+Riv8ubTjD52O0JeZ98p52X
+  nuViEa9M9ZutVg92O2XIwV6JZbRkh3FleLz+dzKWdUUj/mI0tXg9Lk9XDpRKoVzP
+  Ez08AfHFslKWp1v4b5BI0u7gsRbpplKSwooDX42d8PL3x/ckz/s1ThUViGjNgzvi
+  aQIDAQAB
+  -----END PUBLIC KEY-----
+
+x-observer-private-key: &observer_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCiKQOIgJOFK5V8
+  TUms3fkVojGQecDAuR7wVYvtlTzbx0va8IEfJVf1uooOUXYXY60NeuaMOUakDoxS
+  /wTY8EMWGyv5TMm3Sptm/kEZT2BbtnULOfi7E7UNtyjyVqBs7nVUQHeMBq5tWtSu
+  9aGRYX7vjzqQqOSgyNj3zWMlRE/OUhIPJzwIg/DC4bgR9CKH5GK/y5tOMPnY7Ql5
+  n3ynnZee5WIRr0z1m61WD3Y7ZcjBXolltGSHcWV4vP53MpZ1RSP+YjS1eD0uT1cO
+  lEqhXM8TPTwB8cWyUpanW/hvkEjS7uCxFummUpLCigNfjZ3w8vfH9yTP+zVOFRWI
+  aM2DO+JpAgMBAAECggEAEQuwpGOnniMDtqpFKVe3/C8teJtjyJ5tAyRq7hF28T9U
+  2PHZENYTFfCC3Jhximne4gDeRTUsGMiytXK7Jrayxpsalz0cIxlDlqL5Yti2L03R
+  pdl1LO0YZhWvxzGV8X1rdezE5EI7iaE3pCCL2EVgW3w50sT+K2yRahL77gntPam1
+  13f+DxNkfspIQJe3jJyLN3nardgfQeTDVW+C154gMdbxoBwCH3L0IN+AvwFhsNYk
+  c5qO4+JoZSK+X+X5T98s49vTwEIrzoCfZZQ/gaHaFrP0BFCdOf77cMY+sJyGKMIL
+  lmenmzBQ2SyPo0jdoJ6QZaFREuA1Kpwko0zCV+bgAQKBgQDf82INN74J317Amk04
+  7jfN0jEjW63UYczDcInn5jAjUAF1s2zpd7TBylGW41WoHYMcxsOOBsxxQZoH1TBZ
+  ak30lfadeTR+2v7gwf/X93xSRIr7t7hEhO80hBG5343E7NaSECPN043H/kx+Z8Rl
+  4OwJeLlZRLm4CZCubNwxsvj2aQKBgQC5XeKhtr5pUOI+vwnwwpWo9P7oeyjXk3EW
+  8gzpjS5Jwq2KOY7k1MfoGKsx2+eFrABjc5xteE8tPKGWjHFNztvOfdXZAbPH0EUO
+  uYxX/JVSYu3BfNnoPQZtoSo7Vbvhm4sCZTkxfmq2kfJZrnMCa/ScLVyJuai4XCPQ
+  G3XOJEYMAQKBgQDIcayXLAc6CuVh+jmX9Q+ZdsJoZUxGxWpimz2zhAId+SP1Vyzq
+  Iix1L0KrjLpECHYrsXOikU83J4JX9GacAVvYyMi81Zk42YY7YSg/AtIRSCwldKDH
+  Izx+gp7jAMaBNYIvpaaGOQ2zrVaF5RaSISjiqV0sGyknIdiPZfwHt6rB0QKBgQCS
+  G6+MOefCSW/bd2dVb3rZryrRgmpB6cSlCmslGBQZLaruHcpFEnbzuaYO6b+G/Hld
+  6n2tR7xY8saHTPHuG5PkIgmSQCY95CranWRC4iOsya+P6GI2DQvpE7SfCkfKX3jl
+  jXXUTkm82DMHf1rF2OP4ykR7hmy3zGCqI0rrDmpsAQKBgEVfw6SjFdUIDC3JpIMU
+  7BU2rlMLifr8m6hfo2YPHZPhRU1Wc1JeVfQgCcIX/zB8Tt2qxmsZ+f0Q6lvjNBVx
+  bZso9z0nWW9z4utSAmDDXVFEZSo7YUo5esx3dVvsAG/dsFLOuFnwI6OfOkx7YDgX
+  NoTGBVl2R74dpX5VmAqpA9Eo
+  -----END PRIVATE KEY-----
+
+x-operator-public-key: &operator_public |-
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtYVz7YiCYAEs3cfVwNwh
+  bJJXJn0h/zhwy6VW6XEBMEKJ1IhXDuQ0uuJz2Leu/7zhqD1QJn/bvtBxu5RD8BzI
+  vdRgI574Fvd8K3L1SMpxEU2x5MdEmQwFjiW0JE6GSMhwZCMB/9jU1vYwnk91xoBk
+  CvWp6i9bJhBv+gQ2Grt5YxqLdDZkLDSPDzW3UMvFsuC37Wa4U29+g3ttTjor0X6f
+  Wu7UyUQJHXgKy0yRMELvckwFcjJQr04DNLhmll2oKKnZyuCwjRIIbeL0ckAYvUyk
+  xidA0UGISCUfTVEpf5Jpmq4pwDNiPX6c7FCEIEUAgc03X7kr0VT7JSiF5saDJBmI
+  QwIDAQAB
+  -----END PUBLIC KEY-----
+
+x-operator-private-key: &operator_private |-
+  -----BEGIN PRIVATE KEY-----
+  MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC1hXPtiIJgASzd
+  x9XA3CFsklcmfSH/OHDLpVbpcQEwQonUiFcO5DS64nPYt67/vOGoPVAmf9u+0HG7
+  lEPwHMi91GAjnvgW93wrcvVIynERTbHkx0SZDAWOJbQkToZIyHBkIwH/2NTW9jCe
+  T3XGgGQK9anqL1smEG/6BDYau3ljGot0NmQsNI8PNbdQy8Wy4LftZrhTb36De21O
+  OivRfp9a7tTJRAkdeArLTJEwQu9yTAVyMlCvTgM0uGaWXagoqdnK4LCNEght4vRy
+  QBi9TKTGJ0DRQYhIJR9NUSl/kmmarinAM2I9fpzsUIQgRQCBzTdfuSvRVPslKIXm
+  xoMkGYhDAgMBAAECggEABMo+JYEaFHFGsmq8KXgY0OYJTLSCoCe1U+DLqu9Wqhcn
+  aFqMr/gceBrS41+9fqjvH3xp6aPE51BWBmHCnsraDtnuC4j9xpIs6AycvzLJ/W+A
+  1HOs5YkB4IVk/CXiUngpMLGuMzn3XxDLqaT/i6E5tc+G9obdyRX0wbLSWeEJy/0M
+  2mjqUl9e1yK9uQ57Juuyayv3t7DU4+nSjj6ylCK2NDhEmDNKXbNVukIYoEbNJ2GD
+  2Ws1VMNCV0sGKcwZNJeaXE3cmpmw6pOlkTfbs7Nmw00IRsxYbAvjySzDrFWNt3Z+
+  167FHgWSwL0wQ/FPlVRT+AUJsJpjJ/8GL4BR3A834QKBgQD2q9X7IIpheBGRq1D5
+  NOurQDogWRDIjSZgUKvLZXHvxhLmbidcHn2ClFod7NHWRq1BZ9IzVXAiQKqQOLJH
+  MPBhSEma47NuXleWx/mqw2lV6DtSr47tvXlKiDJ0sKNz4MRkaGjjasMUqKhCez8y
+  yzFk8VSztRvNb8yHWYWpwMP6UQKBgQC8Yt0PapEZpmui0cTmg98AllIXPnhw3u1U
+  +z0xycwYZUWuKSea8BoHQOQbz/nId9CeAc+WWoT8uwJXj8/w/Fd7qX0avpzBoigx
+  /LkapG5EfWDYoic/NaCTgnSVy/B2VKj6ZkQsssZP/ze5hy8GjNkmfUh5wxlUMr39
+  4cMH7mFgUwKBgQDSlGecd28rPmFhRiteU/tMuwvkSaS2USmN19CRVw0pcKL57NfV
+  IIJtU1CLc3y/vJ5z07ny8OFFnIb/kCdB91l+80NC41huxENqCVXundvy5sqeEBmo
+  g7RkGFlanOEtL5j5TtkcLCxWGpVqC+Ur66NDVXLF57rQarzkX1xoSpQDwQKBgG9F
+  nfkbIvWZnP4hFUJrJe882uQr3AwfQOPvOigMX+cQ+mVynZggtd8O7y2WXJ2SV8Dc
+  pPbUJLT66Nk7csGO60V5yRFhAUpGM6PC+LrJ4O/Hdsq+jJwDWwOGDMLmIPRj8SNm
+  AGK+ffCGeS22sYoW67SWT5bMLEvVZO9uyDoJDa9NAoGAGLL9wUPEQCAMjVFcMQ4f
+  aGe/BA2gBRvExcHx20tYUWweEtF5vnALWt8jWeRlTTZjMzTBBKGunNt1ZaU0NqJF
+  w/wCBLv1D7PmXC0FoUItePLrwjOFUQLa0zg5dFHhHKFQD9np15EMpJm5ds5m8fg7
+  EH9uwNhK8f+W42C1dhD7UDw=
+  -----END PRIVATE KEY-----
+
 services:
   gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     ports:
       - "18080:5000"
     environment:
       APP_ENV: dev
       REQUEST_TIMEOUT: "3"
-      ADMIN_API_KEY: lab-admin-key
       TOKEN_SERVICE_URL: http://token-service:5003
       INTERNAL_ADMIN_A_URL: http://internal-admin-a:5001
       INTERNAL_ADMIN_B_URL: http://internal-admin-b:5001
       ALLOWED_PROXY_URLS: http://internal-admin-a:5001/health,http://internal-admin-b:5001/health
       GATEWAY_CLIENT_ID: gateway
-      GATEWAY_CLIENT_SECRET: gateway-client-secret
+      GATEWAY_CLIENT_PRIVATE_KEY_PEM: *gateway_private
+      SERVICE_ASSERTION_AUDIENCE: token-service
+      OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      OPERATOR_PUBLIC_KEY_PEM: *operator_public
+      ALLOWED_OPERATOR_IDS: ops-admin
     depends_on:
       - token-service
       - internal-admin-a
@@ -23,49 +192,82 @@ services:
       - ring
 
   internal-admin-a:
-    build: ./internal-admin
+    build:
+      context: .
+      dockerfile: internal-admin/Dockerfile
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-a
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
+      ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
       REDIS_URL: redis://redis:6379/0
+      OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      ALLOWED_OPERATOR_IDS: ops-admin
     expose:
       - "5001"
     networks:
       - ring
 
   internal-admin-b:
-    build: ./internal-admin
+    build:
+      context: .
+      dockerfile: internal-admin/Dockerfile
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-b
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
+      ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
       TOKEN_AUDIENCE: internal-admin
       REDIS_URL: redis://redis:6379/0
+      OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      ALLOWED_OPERATOR_IDS: ops-admin
     expose:
       - "5001"
     networks:
       - ring
 
   token-service:
-    build: ./token-service
+    build:
+      context: .
+      dockerfile: token-service/Dockerfile
     environment:
       APP_ENV: dev
       REDIS_URL: redis://redis:6379/0
       TOKEN_AUDIENCE: internal-admin
-      ACCESS_TOKEN_SECRET: lab-access-token-secret
-      NONCE_TTL_SECONDS: "60"
+      ACCESS_TOKEN_PRIVATE_KEY_PEM: *token_private
       RATE_LIMIT_PER_MINUTE: "120"
       RATE_LIMIT_BURST: "60"
-      GATEWAY_CLIENT_SECRET: gateway-client-secret
-      OBSERVER_CLIENT_SECRET: observer-client-secret
+      GATEWAY_CLIENT_PUBLIC_KEY_PEM: *gateway_public
+      OBSERVER_CLIENT_PUBLIC_KEY_PEM: *observer_public
+      OPERATOR_PUBLIC_KEY_PEM: *operator_public
+      SERVICE_ASSERTION_AUDIENCE: token-service
+      OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+      ALLOWED_OPERATOR_IDS: ops-admin
     expose:
       - "5003"
     depends_on:
       - redis
+    networks:
+      - ring
+
+  tester:
+    build:
+      context: .
+      dockerfile: tester/Dockerfile
+    environment:
+      GATEWAY_CLIENT_PRIVATE_KEY_PEM: *gateway_private
+      OBSERVER_CLIENT_PRIVATE_KEY_PEM: *observer_private
+      OPERATOR_PRIVATE_KEY_PEM: *operator_private
+      SERVICE_ASSERTION_AUDIENCE: token-service
+      OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
+    depends_on:
+      - gateway
+      - token-service
+      - internal-admin-a
+      - internal-admin-b
     networks:
       - ring
 

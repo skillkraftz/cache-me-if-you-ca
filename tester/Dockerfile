@@ -1,9 +1,9 @@
 FROM python:3.11-slim
 WORKDIR /app
-COPY token-service/requirements.txt .
+COPY tester/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY token-service/ .
+COPY tester/ .
 COPY shared/ ./shared/
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
-CMD ["python", "app.py"]
+CMD ["sleep", "infinity"]

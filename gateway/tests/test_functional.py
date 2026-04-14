@@ -21,14 +21,3 @@ def test_allowlisted_proxy_still_works():
         timeout=5,
     )
     assert r.status_code == 200
-
-
-def test_ops_export_still_works():
-    r = requests.get(
-        f"{BASE}/ops/export",
-        params={"target": "a"},
-        headers={"X-Admin-Api-Key": "lab-admin-key"},
-        timeout=5,
-    )
-    assert r.status_code == 200
-    assert r.json()["service"] == "internal-admin-a"

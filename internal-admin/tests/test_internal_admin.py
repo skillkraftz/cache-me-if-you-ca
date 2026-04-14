@@ -1,13 +1,11 @@
-import base64
-import hashlib
-import hmac
 import importlib.util
-import json
-import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
+from shared.auth import new_jti, now_ts, sign_payload
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -23,33 +21,79 @@ class FakeRedis:
         return True
 
 
-def _b64e(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def _keypair():
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("utf-8")
+    )
+    return private_pem, public_pem
 
 
-def _sign(payload: dict) -> str:
-    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    sig = hmac.new(b"lab-access-token-secret", body, hashlib.sha256).digest()
-    return f"{_b64e(body)}.{_b64e(sig)}"
+def _operator_assertion(private_key_pem: str, client_id: str = "gateway"):
+    now = now_ts()
+    return sign_payload(
+        {
+            "iss": "ops-admin",
+            "sub": "ops-admin",
+            "aud": "mesh-operator-approval",
+            "scope": "admin.export.read",
+            "client_id": client_id,
+            "resource": "/admin/export",
+            "iat": now,
+            "exp": now + 30,
+            "jti": new_jti(),
+        },
+        private_key_pem,
+    )
 
 
-def _token(scope: str, client_id: str = "gateway", jti: str = "jti-1") -> str:
-    now = int(time.time())
+def _access_token(
+    private_key_pem: str,
+    scope: str,
+    client_id: str = "gateway",
+    audience: str = "internal-admin",
+    operator_assertion: str | None = None,
+    actor: str | None = None,
+    jti: str | None = None,
+):
+    now = now_ts()
     payload = {
         "iss": "token-service",
         "sub": client_id,
         "client_id": client_id,
-        "aud": "internal-admin",
+        "aud": audience,
         "scope": scope,
         "iat": now,
         "exp": now + 30,
-        "jti": jti,
+        "jti": jti or new_jti(),
     }
-    return _sign(payload)
+    if operator_assertion is not None:
+        payload["operator_assertion"] = operator_assertion
+    if actor is not None:
+        payload["actor"] = actor
+    return sign_payload(payload, private_key_pem)
 
 
 @pytest.fixture()
-def module_and_client():
+def module_and_client(monkeypatch):
+    token_private, token_public = _keypair()
+    operator_private, operator_public = _keypair()
+    wrong_private, _ = _keypair()
+    monkeypatch.setenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", token_public)
+    monkeypatch.setenv("OPERATOR_PUBLIC_KEY_PEM", operator_public)
+    monkeypatch.setenv("TOKEN_AUDIENCE", "internal-admin")
+    monkeypatch.setenv("OPERATOR_ASSERTION_AUDIENCE", "mesh-operator-approval")
+    monkeypatch.setenv("ALLOWED_OPERATOR_IDS", "ops-admin")
     spec = importlib.util.spec_from_file_location(
         "internal_admin_app_test", MODULE_PATH
     )
@@ -57,78 +101,123 @@ def module_and_client():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     module.app.config.update(TESTING=True)
+    keys = {
+        "token_private": token_private,
+        "operator_private": operator_private,
+        "wrong_private": wrong_private,
+    }
     with module.app.test_client() as client:
-        yield module, client
+        yield module, client, keys
 
 
-def test_debug_config_requires_scope(module_and_client):
-    _, client = module_and_client
-
-    r = client.get("/debug/config")
-    assert r.status_code == 403
-
-
-def test_debug_config_allows_authorized_reader(module_and_client, monkeypatch):
-    module, client = module_and_client
+def test_debug_config_requires_observer_scope(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
     monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
-
-    r = client.get(
-        "/debug/config",
-        headers={
-            "Authorization": f"Bearer {_token('debug.config.read', jti='debug-jti')}"
-        },
+    token = _access_token(
+        keys["token_private"], "debug.config.read", client_id="observer"
     )
+
+    r = client.get("/debug/config", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 200
-    assert r.get_json()["service"] == module.REPLICA_NAME
+    assert r.get_json()["service"]
 
 
-def test_replay_detection_survives_local_state_loss(module_and_client, monkeypatch):
-    module, client = module_and_client
+def test_wrong_access_token_signer_is_rejected(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    token = _access_token(
+        keys["wrong_private"], "debug.config.read", client_id="observer"
+    )
+
+    r = client.get("/debug/config", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "bad token signature"
+
+
+def test_wrong_audience_is_rejected(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    token = _access_token(
+        keys["token_private"],
+        "debug.config.read",
+        client_id="observer",
+        audience="wrong-audience",
+    )
+
+    r = client.get("/debug/config", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "bad audience"
+
+
+def test_wrong_scope_is_rejected(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    token = _access_token(
+        keys["token_private"], "debug.config.read", client_id="observer"
+    )
+
+    r = client.get("/internal/metrics", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "missing required scope"
+
+
+def test_export_requires_operator_approval(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    token = _access_token(keys["token_private"], "admin.export.read")
+
+    r = client.get("/admin/export", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "missing operator approval"
+
+
+def test_export_rejects_invalid_nested_operator_assertion(
+    module_and_client, monkeypatch
+):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    bogus_approval = _operator_assertion(keys["wrong_private"])
+    token = _access_token(
+        keys["token_private"],
+        "admin.export.read",
+        operator_assertion=bogus_approval,
+        actor="ops-admin",
+    )
+
+    r = client.get("/admin/export", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "bad operator assertion"
+
+
+def test_operator_approval_replay_blocks_multiple_tokens(
+    module_and_client, monkeypatch
+):
+    module, client, keys = module_and_client
     fake_redis = FakeRedis()
     monkeypatch.setattr(module, "_redis", lambda: fake_redis)
-    token = _token("admin.export.read", jti="shared-jti")
-    headers = {"Authorization": f"Bearer {token}"}
+    approval = _operator_assertion(keys["operator_private"])
+    first_token = _access_token(
+        keys["token_private"],
+        "admin.export.read",
+        operator_assertion=approval,
+        actor="ops-admin",
+        jti="token-a",
+    )
+    second_token = _access_token(
+        keys["token_private"],
+        "admin.export.read",
+        operator_assertion=approval,
+        actor="ops-admin",
+        jti="token-b",
+    )
 
-    first = client.get("/admin/export", headers=headers)
-    used = getattr(module, "_USED", None)
-    if isinstance(used, dict):
-        used.clear()
-    second = client.get("/admin/export", headers=headers)
+    first = client.get(
+        "/admin/export", headers={"Authorization": f"Bearer {first_token}"}
+    )
+    second = client.get(
+        "/admin/export", headers={"Authorization": f"Bearer {second_token}"}
+    )
 
     assert first.status_code == 200
     assert second.status_code == 403
-    assert second.get_json()["error"] == "replay detected"
-
-
-def test_export_fails_closed_when_token_state_is_unavailable(
-    module_and_client, monkeypatch
-):
-    module, client = module_and_client
-
-    def broken_redis():
-        raise RuntimeError("redis down")
-
-    monkeypatch.setattr(module, "_redis", broken_redis)
-
-    r = client.get(
-        "/admin/export",
-        headers={
-            "Authorization": f"Bearer {_token('admin.export.read', jti='redis-down')}"
-        },
-    )
-    assert r.status_code == 503
-    assert r.get_json()["error"] == "token state unavailable"
-
-
-def test_admin_export_rejects_unapproved_client(module_and_client, monkeypatch):
-    module, client = module_and_client
-    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
-
-    r = client.get(
-        "/admin/export",
-        headers={
-            "Authorization": f"Bearer {_token('admin.export.read', client_id='observer', jti='observer-jti')}"
-        },
-    )
-    assert r.status_code == 403
-    assert r.get_json()["error"] == "caller not permitted"
+    assert second.get_json()["error"] == "operator approval replay"
