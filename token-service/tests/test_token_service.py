@@ -67,7 +67,9 @@ def _client_assertion(
     )
 
 
-def _operator_assertion(private_key_pem: str, client_id: str = "gateway"):
+def _operator_assertion(
+    private_key_pem: str, client_id: str = "gateway", target: str = "a"
+):
     now = now_ts()
     return sign_payload(
         {
@@ -77,6 +79,7 @@ def _operator_assertion(private_key_pem: str, client_id: str = "gateway"):
             "scope": "admin.export.read",
             "client_id": client_id,
             "resource": "/admin/export",
+            "target": target,
             "iat": now,
             "exp": now + 30,
             "jti": new_jti(),
@@ -164,7 +167,11 @@ def test_gateway_export_requires_operator_approval(module_and_client, monkeypatc
     module, client, keys = module_and_client
     monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
     body = canonical_json_bytes(
-        {"audience": "internal-admin", "scope": "admin.export.read"}
+        {
+            "audience": "internal-admin",
+            "scope": "admin.export.read",
+            "target_replica": "a",
+        }
     )
 
     r = client.post(
@@ -186,12 +193,13 @@ def test_operator_approval_replay_is_blocked(module_and_client, monkeypatch):
     module, client, keys = module_and_client
     fake_redis = FakeRedis()
     monkeypatch.setattr(module, "_redis", lambda: fake_redis)
-    approval = _operator_assertion(keys["operator_private"])
+    approval = _operator_assertion(keys["operator_private"], target="a")
     body = canonical_json_bytes(
         {
             "audience": "internal-admin",
             "scope": "admin.export.read",
             "operator_assertion": approval,
+            "target_replica": "a",
         }
     )
 
@@ -221,6 +229,34 @@ def test_operator_approval_replay_is_blocked(module_and_client, monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 403
     assert second.get_json()["error"] == "operator approval replay"
+
+
+def test_operator_target_mismatch_is_rejected(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    approval = _operator_assertion(keys["operator_private"], target="a")
+    body = canonical_json_bytes(
+        {
+            "audience": "internal-admin",
+            "scope": "admin.export.read",
+            "operator_assertion": approval,
+            "target_replica": "b",
+        }
+    )
+
+    r = client.post(
+        "/v1/mint",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Client-Id": "gateway",
+            "X-Client-Assertion": _client_assertion(
+                keys["gateway_private"], "gateway", "POST", "/v1/mint", body
+            ),
+        },
+    )
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "operator target mismatch"
 
 
 def test_mint_fails_closed_when_redis_is_unavailable(module_and_client, monkeypatch):

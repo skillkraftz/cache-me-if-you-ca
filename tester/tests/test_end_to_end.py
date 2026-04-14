@@ -17,7 +17,7 @@ OPERATOR_ASSERTION_AUDIENCE = os.getenv(
 )
 
 
-def _operator_assertion(client_id: str = "gateway"):
+def _operator_assertion(client_id: str = "gateway", target: str = "a"):
     now = now_ts()
     return sign_payload(
         {
@@ -27,6 +27,7 @@ def _operator_assertion(client_id: str = "gateway"):
             "scope": "admin.export.read",
             "client_id": client_id,
             "resource": "/admin/export",
+            "target": target,
             "iat": now,
             "exp": now + 30,
             "jti": new_jti(),
@@ -60,10 +61,13 @@ def _mint(
     client_id: str,
     private_key_pem: str,
     operator_assertion: str | None = None,
+    target_replica: str | None = None,
 ):
     payload = {"audience": "internal-admin", "scope": scope}
     if operator_assertion is not None:
         payload["operator_assertion"] = operator_assertion
+    if target_replica is not None:
+        payload["target_replica"] = target_replica
     body = canonical_json_bytes(payload)
     return requests.post(
         f"{TOKEN_SERVICE_BASE}/v1/mint",
@@ -83,7 +87,7 @@ def test_ops_export_still_works_with_operator_assertion():
     r = requests.get(
         f"{GATEWAY_BASE}/ops/export",
         params={"target": "a"},
-        headers={"X-Operator-Assertion": _operator_assertion()},
+        headers={"X-Operator-Assertion": _operator_assertion(target="a")},
         timeout=5,
     )
     assert r.status_code == 200
@@ -122,12 +126,20 @@ def test_gateway_cannot_query_token_discovery_with_service_identity_alone():
 
 
 def test_operator_approval_is_single_use_for_token_minting():
-    approval = _operator_assertion()
+    approval = _operator_assertion(target="a")
     first = _mint(
-        "admin.export.read", "gateway", GATEWAY_CLIENT_PRIVATE_KEY_PEM, approval
+        "admin.export.read",
+        "gateway",
+        GATEWAY_CLIENT_PRIVATE_KEY_PEM,
+        approval,
+        target_replica="a",
     )
     second = _mint(
-        "admin.export.read", "gateway", GATEWAY_CLIENT_PRIVATE_KEY_PEM, approval
+        "admin.export.read",
+        "gateway",
+        GATEWAY_CLIENT_PRIVATE_KEY_PEM,
+        approval,
+        target_replica="a",
     )
     assert first.status_code == 200
     assert second.status_code == 403
@@ -135,9 +147,13 @@ def test_operator_approval_is_single_use_for_token_minting():
 
 
 def test_same_export_token_cannot_be_replayed_across_replicas():
-    approval = _operator_assertion()
+    approval = _operator_assertion(target="a")
     mint = _mint(
-        "admin.export.read", "gateway", GATEWAY_CLIENT_PRIVATE_KEY_PEM, approval
+        "admin.export.read",
+        "gateway",
+        GATEWAY_CLIENT_PRIVATE_KEY_PEM,
+        approval,
+        target_replica="a",
     )
     assert mint.status_code == 200
     token = mint.json()["access_token"]
@@ -155,6 +171,38 @@ def test_same_export_token_cannot_be_replayed_across_replicas():
 
     assert first.status_code == 200
     assert second.status_code == 403
+
+
+def test_operator_approval_cannot_be_redirected_to_other_replica():
+    r = requests.get(
+        f"{GATEWAY_BASE}/ops/export",
+        params={"target": "b"},
+        headers={"X-Operator-Assertion": _operator_assertion(target="a")},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "operator target mismatch"
+
+
+def test_export_token_is_bound_to_target_replica():
+    approval = _operator_assertion(target="a")
+    mint = _mint(
+        "admin.export.read",
+        "gateway",
+        GATEWAY_CLIENT_PRIVATE_KEY_PEM,
+        approval,
+        target_replica="a",
+    )
+    assert mint.status_code == 200
+    token = mint.json()["access_token"]
+
+    r = requests.get(
+        f"{ADMIN_B_BASE}/admin/export",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "wrong target replica"
 
 
 def test_observer_can_still_read_debug_config():

@@ -25,6 +25,11 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "60"))
 ASSERTION_TTL_SECONDS = int(os.getenv("ASSERTION_TTL_SECONDS", "30"))
 ASSERTION_CLOCK_SKEW_SECONDS = int(os.getenv("ASSERTION_CLOCK_SKEW_SECONDS", "5"))
+EXPORT_TARGETS = {
+    value.strip()
+    for value in os.getenv("EXPORT_TARGETS", "a,b").split(",")
+    if value.strip()
+}
 CLIENTS = {
     "gateway": {
         "public_key": os.getenv("GATEWAY_CLIENT_PUBLIC_KEY_PEM", ""),
@@ -127,7 +132,11 @@ def _authenticate_client():
 
 
 def _verify_operator_assertion(
-    operator_assertion: str, client_id: str, scope: str, resource: str
+    operator_assertion: str,
+    client_id: str,
+    scope: str,
+    resource: str,
+    target_replica: str,
 ):
     payload = verify_payload(operator_assertion, OPERATOR_PUBLIC_KEY_PEM)
     if payload is None:
@@ -148,6 +157,8 @@ def _verify_operator_assertion(
         return None, (jsonify({"error": "operator client mismatch"}), 403)
     if payload.get("resource") != resource:
         return None, (jsonify({"error": "operator resource mismatch"}), 403)
+    if payload.get("target") != target_replica:
+        return None, (jsonify({"error": "operator target mismatch"}), 403)
     jti = payload.get("jti")
     if not jti:
         return None, (jsonify({"error": "missing operator assertion jti"}), 403)
@@ -190,6 +201,7 @@ def mint():
     data = request.get_json(force=True, silent=True) or {}
     aud = data.get("audience", "")
     scope = data.get("scope", "")
+    target_replica = str(data.get("target_replica") or "")
     if aud != TOKEN_AUDIENCE:
         return jsonify({"error": "bad audience"}), 400
     if scope not in client["token_grants"]:
@@ -199,14 +211,18 @@ def mint():
     if scope in client["operator_scopes"]:
         if not operator_assertion:
             return jsonify({"error": "operator approval required"}), 403
+        if target_replica not in EXPORT_TARGETS:
+            return jsonify({"error": "bad target replica"}), 400
         operator_payload, err = _verify_operator_assertion(
-            operator_assertion, client_id, scope, "/admin/export"
+            operator_assertion, client_id, scope, "/admin/export", target_replica
         )
         if err:
             return err
         actor = operator_payload["sub"]
     elif operator_assertion:
         return jsonify({"error": "operator approval not accepted for scope"}), 400
+    elif target_replica:
+        return jsonify({"error": "target replica not accepted for scope"}), 400
     now = now_ts()
     payload = {
         "iss": "token-service",
@@ -221,6 +237,7 @@ def mint():
     if operator_assertion:
         payload["actor"] = actor
         payload["operator_assertion"] = operator_assertion
+        payload["target_replica"] = target_replica
     return jsonify(
         {
             "access_token": sign_payload(payload, ACCESS_TOKEN_PRIVATE_KEY_PEM),

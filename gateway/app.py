@@ -19,6 +19,8 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3"))
 TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "http://token-service:5003")
 INTERNAL_ADMIN_A_URL = os.getenv("INTERNAL_ADMIN_A_URL", "http://internal-admin-a:5001")
 INTERNAL_ADMIN_B_URL = os.getenv("INTERNAL_ADMIN_B_URL", "http://internal-admin-b:5001")
+TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
+ACCESS_TOKEN_PUBLIC_KEY_PEM = os.getenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", "")
 ALLOWED_PROXY_URLS = {
     u.strip() for u in os.getenv("ALLOWED_PROXY_URLS", "").split(",") if u.strip()
 }
@@ -107,7 +109,10 @@ def _safe_fetch(target: str):
 
 
 def _validate_operator_assertion(
-    operator_assertion: str, expected_scope: str, expected_resource: str
+    operator_assertion: str,
+    expected_scope: str,
+    expected_resource: str,
+    expected_target: str,
 ):
     payload = verify_payload(operator_assertion, OPERATOR_PUBLIC_KEY_PEM)
     if payload is None:
@@ -126,6 +131,8 @@ def _validate_operator_assertion(
         return None, "operator client mismatch"
     if payload.get("resource") != expected_resource:
         return None, "operator resource mismatch"
+    if payload.get("target") != expected_target:
+        return None, "operator target mismatch"
     if payload.get("iat", 0) > now + ASSERTION_CLOCK_SKEW_SECONDS:
         return None, "operator assertion not yet valid"
     if payload.get("exp", 0) < now - ASSERTION_CLOCK_SKEW_SECONDS:
@@ -135,14 +142,50 @@ def _validate_operator_assertion(
     return payload, None
 
 
-def _require_operator(scope: str, resource: str):
+def _require_operator(scope: str, resource: str, target: str):
     operator_assertion = request.headers.get("X-Operator-Assertion", "").strip()
     if not operator_assertion:
         return None, (jsonify({"error": "forbidden"}), 403)
-    _, err = _validate_operator_assertion(operator_assertion, scope, resource)
+    _, err = _validate_operator_assertion(operator_assertion, scope, resource, target)
     if err:
         return None, (jsonify({"error": err}), 403)
     return operator_assertion, None
+
+
+def _validate_export_token(token: str, expected_target: str):
+    payload = verify_payload(token, ACCESS_TOKEN_PUBLIC_KEY_PEM)
+    if payload is None:
+        return None, "bad token signature"
+    now = now_ts()
+    if payload.get("iat", 0) > now + ASSERTION_CLOCK_SKEW_SECONDS:
+        return None, "token not yet valid"
+    if payload.get("exp", 0) < now - ASSERTION_CLOCK_SKEW_SECONDS:
+        return None, "token expired"
+    if payload.get("iss") != "token-service":
+        return None, "bad token issuer"
+    if payload.get("aud") != TOKEN_AUDIENCE:
+        return None, "bad token audience"
+    if (
+        payload.get("client_id") != GATEWAY_CLIENT_ID
+        or payload.get("sub") != GATEWAY_CLIENT_ID
+    ):
+        return None, "bad token client"
+    scopes = set((payload.get("scope") or "").split())
+    if "admin.export.read" not in scopes:
+        return None, "missing export scope"
+    if payload.get("target_replica") != expected_target:
+        return None, "wrong target replica"
+    operator_assertion = payload.get("operator_assertion", "")
+    if not operator_assertion:
+        return None, "missing operator approval"
+    operator_payload, err = _validate_operator_assertion(
+        operator_assertion, "admin.export.read", "/admin/export", expected_target
+    )
+    if err:
+        return None, err
+    if payload.get("actor") != operator_payload.get("sub"):
+        return None, "actor mismatch"
+    return payload, None
 
 
 def _build_service_assertion(method: str, path: str, body_bytes: bytes) -> str:
@@ -226,7 +269,12 @@ def proxy_allowlisted():
 def raw_token():
     if not ENABLE_RAW_TOKEN_HELPER:
         return jsonify({"error": "gone"}), 410
-    operator_assertion, err = _require_operator("admin.export.read", "/admin/export")
+    target = request.args.get("target", "a")
+    if _admin_target(target) is None:
+        return jsonify({"error": "unknown target"}), 400
+    operator_assertion, err = _require_operator(
+        "admin.export.read", "/admin/export", target
+    )
     if err:
         return err
     scope = request.args.get("scope", "admin.export.read")
@@ -237,6 +285,7 @@ def raw_token():
                 "audience": "internal-admin",
                 "scope": scope,
                 "operator_assertion": operator_assertion,
+                "target_replica": target,
             },
         )
         return _passthrough_response(r)
@@ -246,14 +295,17 @@ def raw_token():
 
 @app.get("/ops/use-token")
 def use_token():
-    _, err = _require_operator("admin.export.read", "/admin/export")
-    if err:
-        return err
-    token = request.args.get("token", "")
     target = request.args.get("target", "a")
     base = _admin_target(target)
     if base is None:
         return jsonify({"error": "unknown target"}), 400
+    _, err = _require_operator("admin.export.read", "/admin/export", target)
+    if err:
+        return err
+    token = request.args.get("token", "")
+    _, token_err = _validate_export_token(token, target)
+    if token_err:
+        return jsonify({"error": token_err}), 403
     try:
         r = _request(
             "GET", f"{base}/admin/export", headers={"Authorization": f"Bearer {token}"}
@@ -265,13 +317,15 @@ def use_token():
 
 @app.get("/ops/export")
 def export():
-    operator_assertion, err = _require_operator("admin.export.read", "/admin/export")
-    if err:
-        return err
     target = request.args.get("target", "a")
     base = _admin_target(target)
     if base is None:
         return jsonify({"error": "unknown target"}), 400
+    operator_assertion, err = _require_operator(
+        "admin.export.read", "/admin/export", target
+    )
+    if err:
+        return err
     try:
         mint = _token_service_post(
             "/v1/mint",
@@ -279,11 +333,15 @@ def export():
                 "audience": "internal-admin",
                 "scope": "admin.export.read",
                 "operator_assertion": operator_assertion,
+                "target_replica": target,
             },
         )
         if mint.status_code != 200:
             return _passthrough_response(mint)
         token = mint.json()["access_token"]
+        _, token_err = _validate_export_token(token, target)
+        if token_err:
+            return jsonify({"error": token_err}), 502
         r = _request(
             "GET", f"{base}/admin/export", headers={"Authorization": f"Bearer {token}"}
         )

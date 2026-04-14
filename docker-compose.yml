@@ -178,6 +178,8 @@ services:
       ALLOWED_PROXY_URLS: http://internal-admin-a:5001/health,http://internal-admin-b:5001/health
       GATEWAY_CLIENT_ID: gateway
       GATEWAY_CLIENT_PRIVATE_KEY_PEM: *gateway_private
+      ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
+      TOKEN_AUDIENCE: internal-admin
       SERVICE_ASSERTION_AUDIENCE: token-service
       OPERATOR_ASSERTION_AUDIENCE: mesh-operator-approval
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
@@ -198,6 +200,7 @@ services:
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-a
+      REPLICA_TARGET: a
       ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
@@ -217,6 +220,7 @@ services:
     environment:
       APP_ENV: dev
       REPLICA_NAME: internal-admin-b
+      REPLICA_TARGET: b
       ACCESS_TOKEN_PUBLIC_KEY_PEM: *token_public
       OPERATOR_PUBLIC_KEY_PEM: *operator_public
       JTI_CACHE_TTL_SECONDS: "120"
@@ -240,6 +244,7 @@ services:
       ACCESS_TOKEN_PRIVATE_KEY_PEM: *token_private
       RATE_LIMIT_PER_MINUTE: "120"
       RATE_LIMIT_BURST: "60"
+      EXPORT_TARGETS: a,b
       GATEWAY_CLIENT_PUBLIC_KEY_PEM: *gateway_public
       OBSERVER_CLIENT_PUBLIC_KEY_PEM: *observer_public
       OPERATOR_PUBLIC_KEY_PEM: *operator_public

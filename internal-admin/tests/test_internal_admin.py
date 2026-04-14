@@ -39,7 +39,9 @@ def _keypair():
     return private_pem, public_pem
 
 
-def _operator_assertion(private_key_pem: str, client_id: str = "gateway"):
+def _operator_assertion(
+    private_key_pem: str, client_id: str = "gateway", target: str = "a"
+):
     now = now_ts()
     return sign_payload(
         {
@@ -49,6 +51,7 @@ def _operator_assertion(private_key_pem: str, client_id: str = "gateway"):
             "scope": "admin.export.read",
             "client_id": client_id,
             "resource": "/admin/export",
+            "target": target,
             "iat": now,
             "exp": now + 30,
             "jti": new_jti(),
@@ -64,6 +67,7 @@ def _access_token(
     audience: str = "internal-admin",
     operator_assertion: str | None = None,
     actor: str | None = None,
+    target_replica: str | None = None,
     jti: str | None = None,
 ):
     now = now_ts()
@@ -81,6 +85,8 @@ def _access_token(
         payload["operator_assertion"] = operator_assertion
     if actor is not None:
         payload["actor"] = actor
+    if target_replica is not None:
+        payload["target_replica"] = target_replica
     return sign_payload(payload, private_key_pem)
 
 
@@ -92,6 +98,7 @@ def module_and_client(monkeypatch):
     monkeypatch.setenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", token_public)
     monkeypatch.setenv("OPERATOR_PUBLIC_KEY_PEM", operator_public)
     monkeypatch.setenv("TOKEN_AUDIENCE", "internal-admin")
+    monkeypatch.setenv("REPLICA_TARGET", "a")
     monkeypatch.setenv("OPERATOR_ASSERTION_AUDIENCE", "mesh-operator-approval")
     monkeypatch.setenv("ALLOWED_OPERATOR_IDS", "ops-admin")
     spec = importlib.util.spec_from_file_location(
@@ -176,12 +183,13 @@ def test_export_rejects_invalid_nested_operator_assertion(
 ):
     module, client, keys = module_and_client
     monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
-    bogus_approval = _operator_assertion(keys["wrong_private"])
+    bogus_approval = _operator_assertion(keys["wrong_private"], target="a")
     token = _access_token(
         keys["token_private"],
         "admin.export.read",
         operator_assertion=bogus_approval,
         actor="ops-admin",
+        target_replica="a",
     )
 
     r = client.get("/admin/export", headers={"Authorization": f"Bearer {token}"})
@@ -195,12 +203,13 @@ def test_operator_approval_replay_blocks_multiple_tokens(
     module, client, keys = module_and_client
     fake_redis = FakeRedis()
     monkeypatch.setattr(module, "_redis", lambda: fake_redis)
-    approval = _operator_assertion(keys["operator_private"])
+    approval = _operator_assertion(keys["operator_private"], target="a")
     first_token = _access_token(
         keys["token_private"],
         "admin.export.read",
         operator_assertion=approval,
         actor="ops-admin",
+        target_replica="a",
         jti="token-a",
     )
     second_token = _access_token(
@@ -208,6 +217,7 @@ def test_operator_approval_replay_blocks_multiple_tokens(
         "admin.export.read",
         operator_assertion=approval,
         actor="ops-admin",
+        target_replica="a",
         jti="token-b",
     )
 
@@ -221,3 +231,20 @@ def test_operator_approval_replay_blocks_multiple_tokens(
     assert first.status_code == 200
     assert second.status_code == 403
     assert second.get_json()["error"] == "operator approval replay"
+
+
+def test_export_rejects_wrong_target_replica(module_and_client, monkeypatch):
+    module, client, keys = module_and_client
+    monkeypatch.setattr(module, "_redis", lambda: FakeRedis())
+    approval = _operator_assertion(keys["operator_private"], target="a")
+    token = _access_token(
+        keys["token_private"],
+        "admin.export.read",
+        operator_assertion=approval,
+        actor="ops-admin",
+        target_replica="b",
+    )
+
+    r = client.get("/admin/export", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "wrong target replica"

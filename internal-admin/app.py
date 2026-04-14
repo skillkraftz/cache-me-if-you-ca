@@ -7,6 +7,7 @@ from shared.auth import now_ts, verify_payload
 
 app = Flask(__name__)
 REPLICA_NAME = os.getenv("REPLICA_NAME", "internal-admin")
+REPLICA_TARGET = os.getenv("REPLICA_TARGET", "a")
 TOKEN_AUDIENCE = os.getenv("TOKEN_AUDIENCE", "internal-admin")
 ACCESS_TOKEN_PUBLIC_KEY_PEM = os.getenv("ACCESS_TOKEN_PUBLIC_KEY_PEM", "")
 OPERATOR_PUBLIC_KEY_PEM = os.getenv("OPERATOR_PUBLIC_KEY_PEM", "")
@@ -55,7 +56,11 @@ def _validate_window(payload: dict, kind: str):
 
 
 def _verify_operator_assertion(
-    operator_assertion: str, client_id: str, scope: str, resource: str
+    operator_assertion: str,
+    client_id: str,
+    scope: str,
+    resource: str,
+    target_replica: str,
 ):
     payload = verify_payload(operator_assertion, OPERATOR_PUBLIC_KEY_PEM)
     if payload is None:
@@ -76,6 +81,8 @@ def _verify_operator_assertion(
         return None, "operator client mismatch", 403
     if payload.get("resource") != resource:
         return None, "operator resource mismatch", 403
+    if payload.get("target") != target_replica:
+        return None, "operator target mismatch", 403
     jti = payload.get("jti")
     if not jti:
         return None, "missing operator assertion jti", 403
@@ -137,8 +144,10 @@ def require_scope(scope: str):
         operator_assertion = payload.get("operator_assertion", "")
         if not operator_assertion:
             return None, (jsonify({"error": "missing operator approval"}), 403)
+        if payload.get("target_replica") != REPLICA_TARGET:
+            return None, (jsonify({"error": "wrong target replica"}), 403)
         operator_payload, err, status = _verify_operator_assertion(
-            operator_assertion, client_id, scope, policy["resource"]
+            operator_assertion, client_id, scope, policy["resource"], REPLICA_TARGET
         )
         if err:
             return None, (jsonify({"error": err}), status)
@@ -166,6 +175,7 @@ def debug_config():
             "token_audience": TOKEN_AUDIENCE,
             "redis_url": REDIS_URL,
             "replica": REPLICA_NAME,
+            "replica_target": REPLICA_TARGET,
             "allowed_subjects": ["observer"],
         }
     )
