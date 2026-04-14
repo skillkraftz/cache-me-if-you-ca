@@ -193,6 +193,7 @@ def test_export_rejects_minted_token_for_wrong_target(module_and_client, monkeyp
         "/ops/export",
         query_string={"target": "a"},
         headers={"X-Operator-Assertion": approval},
+        environ_overrides={"operator_transport_verified": "1"},
     )
 
     assert r.status_code == 502
@@ -224,6 +225,7 @@ def test_use_token_rejects_wrong_target_token(module_and_client, monkeypatch):
         "/ops/use-token",
         query_string=params,
         headers={"X-Operator-Assertion": approval},
+        environ_overrides={"operator_transport_verified": "1"},
     )
 
     assert r.status_code == 403
@@ -246,11 +248,13 @@ def test_use_token_rejects_replayed_operator_proof(module_and_client, monkeypatc
         "/ops/use-token",
         query_string=params,
         headers={"X-Operator-Assertion": approval},
+        environ_overrides={"operator_transport_verified": "1"},
     )
     second = client.get(
         "/ops/use-token",
         query_string=params,
         headers={"X-Operator-Assertion": approval},
+        environ_overrides={"operator_transport_verified": "1"},
     )
 
     assert first.status_code == 403
@@ -296,6 +300,7 @@ def test_export_rejects_invalid_response_proof(module_and_client, monkeypatch):
         "/ops/export",
         query_string={"target": "a"},
         headers={"X-Operator-Assertion": approval},
+        environ_overrides={"operator_transport_verified": "1"},
     )
 
     assert r.status_code == 502

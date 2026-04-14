@@ -1,5 +1,8 @@
 import os
+import tempfile
+from pathlib import Path
 
+import pytest
 import requests
 
 from shared.auth import (
@@ -12,6 +15,7 @@ from shared.auth import (
 )
 
 GATEWAY_BASE = "http://gateway:5000"
+GATEWAY_OPERATOR_BASE = "https://gateway:5443"
 TOKEN_SERVICE_BASE = "http://token-service:5003"
 ADMIN_A_BASE = "http://internal-admin-a:5001"
 ADMIN_B_BASE = "http://internal-admin-b:5001"
@@ -25,6 +29,39 @@ OPERATOR_ASSERTION_AUDIENCE = os.getenv(
 RESPONSE_PROOF_AUDIENCE = os.getenv("RESPONSE_PROOF_AUDIENCE", "gateway")
 ADMIN_A_RESPONSE_PUBLIC_KEY_PEM = os.environ["INTERNAL_ADMIN_A_RESPONSE_PUBLIC_KEY_PEM"]
 ADMIN_B_RESPONSE_PUBLIC_KEY_PEM = os.environ["INTERNAL_ADMIN_B_RESPONSE_PUBLIC_KEY_PEM"]
+GATEWAY_TLS_CA_CERT_PEM = os.environ["GATEWAY_TLS_CA_CERT_PEM"]
+OPERATOR_CLIENT_CERT_PEM = os.environ["OPERATOR_CLIENT_CERT_PEM"]
+OPERATOR_CLIENT_KEY_PEM = os.environ["OPERATOR_CLIENT_KEY_PEM"]
+
+_CERT_DIR = Path(tempfile.mkdtemp(prefix="cache-me-if-you-ca-tester-mtls-"))
+
+
+def _write_pem(name: str, content: str) -> str:
+    path = _CERT_DIR / name
+    path.write_text(content, encoding="utf-8")
+    return str(path)
+
+
+GATEWAY_TLS_CA_CERT_FILE = _write_pem("gateway-ca.crt", GATEWAY_TLS_CA_CERT_PEM)
+OPERATOR_CLIENT_CERT_FILE = _write_pem("operator-client.crt", OPERATOR_CLIENT_CERT_PEM)
+OPERATOR_CLIENT_KEY_FILE = _write_pem("operator-client.key", OPERATOR_CLIENT_KEY_PEM)
+
+
+def _operator_tls_kwargs():
+    return {
+        "verify": GATEWAY_TLS_CA_CERT_FILE,
+        "cert": (OPERATOR_CLIENT_CERT_FILE, OPERATOR_CLIENT_KEY_FILE),
+    }
+
+
+def _operator_get(path: str, params: dict[str, str], proof: str):
+    return requests.get(
+        f"{GATEWAY_OPERATOR_BASE}{path}",
+        params=params,
+        headers={"X-Operator-Assertion": proof},
+        timeout=5,
+        **_operator_tls_kwargs(),
+    )
 
 
 def _gateway_query_hash(params: dict[str, str]) -> str:
@@ -138,13 +175,8 @@ def _verify_response_proof(body: dict, public_key_pem: str, expected_target: str
 
 def test_ops_export_still_works_with_operator_assertion():
     params = {"target": "a"}
-    r = requests.get(
-        f"{GATEWAY_BASE}/ops/export",
-        params=params,
-        headers={
-            "X-Operator-Assertion": _operator_assertion("/ops/export", params, "a")
-        },
-        timeout=5,
+    r = _operator_get(
+        "/ops/export", params, _operator_assertion("/ops/export", params, "a")
     )
     assert r.status_code == 200
     assert r.json()["service"] == "internal-admin-a"
@@ -232,15 +264,10 @@ def test_same_export_token_cannot_be_replayed_across_replicas():
 
 def test_operator_approval_cannot_be_redirected_to_other_replica():
     params = {"target": "b"}
-    r = requests.get(
-        f"{GATEWAY_BASE}/ops/export",
-        params=params,
-        headers={
-            "X-Operator-Assertion": _operator_assertion(
-                "/ops/export", {"target": "a"}, "a"
-            )
-        },
-        timeout=5,
+    r = _operator_get(
+        "/ops/export",
+        params,
+        _operator_assertion("/ops/export", {"target": "a"}, "a"),
     )
     assert r.status_code == 403
     assert r.json()["error"] == "operator target mismatch"
@@ -271,18 +298,8 @@ def test_operator_proof_is_single_use_at_gateway():
     params = {"target": "a"}
     proof = _operator_assertion("/ops/export", params, "a")
 
-    first = requests.get(
-        f"{GATEWAY_BASE}/ops/export",
-        params=params,
-        headers={"X-Operator-Assertion": proof},
-        timeout=5,
-    )
-    second = requests.get(
-        f"{GATEWAY_BASE}/ops/export",
-        params=params,
-        headers={"X-Operator-Assertion": proof},
-        timeout=5,
-    )
+    first = _operator_get("/ops/export", params, proof)
+    second = _operator_get("/ops/export", params, proof)
 
     assert first.status_code == 200
     assert second.status_code == 403
@@ -293,15 +310,36 @@ def test_operator_proof_cannot_be_rebound_to_use_token_request():
     export_params = {"target": "a"}
     proof = _operator_assertion("/ops/export", export_params, "a")
 
-    r = requests.get(
-        f"{GATEWAY_BASE}/ops/use-token",
-        params={"target": "a", "token": "placeholder"},
-        headers={"X-Operator-Assertion": proof},
-        timeout=5,
-    )
+    r = _operator_get("/ops/use-token", {"target": "a", "token": "placeholder"}, proof)
 
     assert r.status_code == 403
     assert r.json()["error"] == "operator request mismatch"
+
+
+def test_operator_routes_require_mtls_transport():
+    params = {"target": "a"}
+    proof = _operator_assertion("/ops/export", params, "a")
+    r = requests.get(
+        f"{GATEWAY_BASE}/ops/export",
+        params=params,
+        headers={"X-Operator-Assertion": proof},
+        timeout=5,
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "mTLS required"
+
+
+def test_operator_tls_without_client_cert_is_rejected():
+    params = {"target": "a"}
+    proof = _operator_assertion("/ops/export", params, "a")
+    with pytest.raises(requests.exceptions.SSLError):
+        requests.get(
+            f"{GATEWAY_OPERATOR_BASE}/ops/export",
+            params=params,
+            headers={"X-Operator-Assertion": proof},
+            timeout=5,
+            verify=GATEWAY_TLS_CA_CERT_FILE,
+        )
 
 
 def test_observer_can_still_read_debug_config():

@@ -6,4 +6,4 @@ COPY gateway/ .
 COPY shared/ ./shared/
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
-CMD ["python", "app.py"]
+CMD ["python", "serve.py"]

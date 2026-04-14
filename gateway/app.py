@@ -57,6 +57,15 @@ def _redis():
     return redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
+@app.before_request
+def require_operator_transport():
+    if (
+        request.path.startswith("/ops/")
+        and request.environ.get("operator_transport_verified") != "1"
+    ):
+        return jsonify({"error": "mTLS required"}), 403
+
+
 def _request(method: str, url: str, **kwargs):
     kwargs.setdefault("timeout", REQUEST_TIMEOUT)
     with requests.Session() as session:
